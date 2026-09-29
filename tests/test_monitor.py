@@ -352,7 +352,7 @@ class FakeClient:
 
 def _manager(client, settings=None, history=None, **server_kwargs):
     server = ServerConfig(name="srv", host="h", username="u", **server_kwargs)
-    settings = settings or AppSettings(poll_interval_seconds=2.0, process_limit=3)
+    settings = settings or AppSettings(poll_interval_seconds=2.0, process_limit=3, latency_probe="ssh")
     config = Config(settings=settings, servers=(server,))
     client.server = server
     manager = MonitorManager(config, client_factory=lambda _s, _a: client, history=history)
@@ -471,7 +471,8 @@ def test_monitor_records_history_and_emits_threshold_alerts():
     client = FakeClient()
     client.cpu = 99.0
     history = HistoryStore(None)
-    settings = AppSettings(poll_interval_seconds=2.0, thresholds=ThresholdSettings(sustain_polls=2))
+    settings = AppSettings(poll_interval_seconds=2.0, thresholds=ThresholdSettings(sustain_polls=2),
+                           latency_probe="ssh")
     manager = _manager(client, settings=settings, history=history)
     manager.start()
     try:
@@ -671,7 +672,7 @@ def test_apply_config_adds_updates_and_removes_servers_live():
         clients.setdefault(server.name, []).append(client)
         return client
 
-    settings = AppSettings(poll_interval_seconds=2.0)
+    settings = AppSettings(poll_interval_seconds=2.0, latency_probe="ssh")
     a, b = ServerConfig(name="a", host="h", username="u"), ServerConfig(name="b", host="h2", username="u")
     manager = MonitorManager(Config(settings=settings, servers=(a, b)), client_factory=factory)
     manager.start()
@@ -688,3 +689,28 @@ def test_apply_config_adds_updates_and_removes_servers_live():
         assert manager.server_names == ["b"]
     finally:
         manager.stop()
+
+
+def test_icmp_only_on_a_network_path_and_resolves_once(monkeypatch):
+    """ICMP só quando o PC alcança o servidor pela rede (direto/VPN); com túnel a latência vem do SSH.
+    O endereço é resolvido uma vez: um DNS lento não atrasa cada coleta."""
+    from config.settings import ConnectorConfig
+    from core import monitor as monitor_module
+    from core import winapi
+
+    lookups, pings = [], []
+    monkeypatch.setattr(winapi, "IS_WINDOWS", True)
+    monkeypatch.setattr(winapi, "icmp_ping", lambda address, timeout: pings.append(address) or 3.5)
+    monkeypatch.setattr(monitor_module.socket, "getaddrinfo",
+                        lambda host, *a: lookups.append(host) or [(2, 1, 6, "", ("192.0.2.10", 0))])
+    settings = AppSettings(latency_probe="auto")
+    direct = _manager(FakeClient(), settings).monitors["srv"]
+    assert direct._icmp_enabled()
+    assert [direct._icmp_probe() for _ in range(3)] == [3.5, 3.5, 3.5]
+    assert lookups == ["h"] and pings == ["192.0.2.10"] * 3
+    vpn = _manager(FakeClient(), settings, connector=ConnectorConfig(type="vpn")).monitors["srv"]
+    assert vpn._icmp_enabled()
+    for kind in ("cloudflared", "socks5", "command"):
+        tunneled = _manager(FakeClient(), settings, connector=ConnectorConfig(type=kind)).monitors["srv"]
+        assert not tunneled._icmp_enabled(), kind
+    assert not _manager(FakeClient(), AppSettings(latency_probe="ssh")).monitors["srv"]._icmp_enabled()

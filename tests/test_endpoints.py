@@ -164,7 +164,8 @@ def test_tls_only_and_tcp(pki, https_servers, http_server):
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         closed = sock.getsockname()[1]
-    refused = check_endpoint(parse_endpoint(f"tcp://127.0.0.1:{closed}"), timeout=2)
+    # O Windows repete o SYN por ~2 s antes de devolver "recusada"; 5 s cabe nos dois sistemas.
+    refused = check_endpoint(parse_endpoint(f"tcp://127.0.0.1:{closed}"), timeout=5)
     assert refused.status is ServiceStatus.FAILED and "recusada" in refused.detail
 
 

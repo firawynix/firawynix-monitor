@@ -128,15 +128,15 @@ def _tls_connect(spec: EndpointSpec, deadline: float, cafile: str | None) -> tup
 def check_endpoint(spec: EndpointSpec, *, timeout: float = 5.0, cert_warning_days: float = 14,
                    now: float | None = None, cafile: str | None = None) -> EndpointResult:
     """``cafile`` substitui o repositório de certificados do Windows (CA interna, testes)."""
-    started = time.monotonic()
-    deadline = started + timeout
+    deadline = time.monotonic() + timeout
+    started = time.perf_counter()  # latência em alta resolução (o monotonic do Windows anda de ~15,6 ms)
     now = time.time() if now is None else now
     cert: dict = {}
     verify_error = None
     try:
         if spec.scheme == "tcp":
             with socket.create_connection((spec.host, spec.port), timeout=timeout):
-                latency = (time.monotonic() - started) * 1000
+                latency = (time.perf_counter() - started) * 1000
             return EndpointResult(spec.raw, spec.scheme, ServiceStatus.ACTIVE, latency, detail="porta aberta",
                                   checked_at=now)
         if spec.scheme in ("https", "tls"):
@@ -148,7 +148,7 @@ def check_endpoint(spec: EndpointSpec, *, timeout: float = 5.0, cert_warning_day
             sock = socket.create_connection((spec.host, spec.port), timeout=timeout)
         with sock:
             if spec.scheme == "tls":
-                latency = (time.monotonic() - started) * 1000
+                latency = (time.perf_counter() - started) * 1000
                 return _finish(spec, now, latency, None, cert, verify_error, cert_warning_days, "")
             sock.settimeout(_remaining(deadline))
             request = (f"GET {spec.path} HTTP/1.1\r\nHost: {spec.host_header}\r\nUser-Agent: {USER_AGENT}\r\n"
@@ -156,7 +156,7 @@ def check_endpoint(spec: EndpointSpec, *, timeout: float = 5.0, cert_warning_day
             sock.sendall(request.encode("latin-1", errors="replace"))
             response = http.client.HTTPResponse(sock, method="GET")
             response.begin()
-            latency = (time.monotonic() - started) * 1000
+            latency = (time.perf_counter() - started) * 1000
             location = response.getheader("Location") or ""
             detail = f"{response.status} {response.reason}".strip()
             if location and 300 <= response.status < 400:

@@ -27,6 +27,7 @@ import fnmatch
 import logging
 import queue
 import random
+import socket
 import threading
 import time
 from collections import defaultdict
@@ -107,6 +108,7 @@ COLLECTOR_WORKERS = 4
 ENDPOINT_WORKERS = 6
 #: No modo "auto", após N pings ICMP sem resposta usa só a latência do SSH.
 ICMP_MAX_FAILURES = 3
+ICMP_RESOLVE_SECONDS = 300.0
 ICMP_RETRY_POLLS = 120
 
 _FAST_TASKS = {"units", "metrics"}
@@ -410,6 +412,7 @@ class ServerMonitor:
         self._endpoint_specs = [parse_endpoint(e) for e in server.endpoints]
         self._icmp_failures = 0
         self._icmp_skip = 0
+        self._icmp_address: tuple[str, float] | None = None
         self._backoff = ExponentialBackoff(base=1.0, maximum=60.0)
         # Credenciais/host key erradas: espaçar bem as tentativas (evita fail2ban).
         self._auth_backoff = ExponentialBackoff(base=30.0, maximum=600.0)
@@ -536,6 +539,7 @@ class ServerMonitor:
         self._backoff.reset()
         self._auth_backoff.reset()
         self._consecutive_timeouts = 0
+        self._icmp_address = None  # resolve de novo (o IP pode ter mudado)
         self._runtime_skip.clear()
         self._due = dict.fromkeys(self._due, 0.0)
         self._set_state(ConnectionState.CONNECTED, f"Conectado a {self.server.address}")
@@ -569,7 +573,7 @@ class ServerMonitor:
             else:
                 tasks[kind.value] = client.list_vms
         if self._icmp_enabled():
-            tasks["icmp"] = (lambda: winapi.icmp_ping(self.server.host, 1000))
+            tasks["icmp"] = self._icmp_probe
 
         detail_due = now >= self._due["detail"]
         if detail_due:
@@ -624,12 +628,28 @@ class ServerMonitor:
         probe = self.settings.latency_probe
         if probe not in ("auto", "icmp") or not winapi.IS_WINDOWS:
             return False
+        if self.server.connector.type not in ("direct", "vpn"):
+            # Túnel (Cloudflare, salto, proxy, comando): o ping iria para o túnel ou nem chegaria;
+            # a latência vem do próprio SSH.
+            return False
         if probe == "auto" and self._icmp_failures >= ICMP_MAX_FAILURES:
             self._icmp_skip -= 1
             if self._icmp_skip > 0:
                 return False
             self._icmp_failures = ICMP_MAX_FAILURES - 1  # uma nova tentativa
         return True
+
+    def _icmp_probe(self) -> float | None:
+        """Ping ICMP com o endereço resolvido uma vez a cada 5 min (DNS lento não atrasa a coleta)."""
+        now = time.monotonic()
+        cached = self._icmp_address
+        if cached is None or now - cached[1] > ICMP_RESOLVE_SECONDS:
+            try:
+                address = socket.getaddrinfo(self.server.host, None, socket.AF_INET)[0][4][0]
+            except (OSError, IndexError):
+                address = ""
+            cached = self._icmp_address = (address, now)
+        return winapi.icmp_ping(cached[0], 1000) if cached[0] else None
 
     def _check_endpoints(self) -> list[EndpointResult]:
         timeout = min(self.settings.command_timeout_seconds, 5.0)

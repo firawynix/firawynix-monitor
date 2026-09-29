@@ -437,14 +437,16 @@ def set_autostart(enabled: bool, command: str, name: str = APP_SOURCE) -> bool:
     import winreg
 
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
-            if enabled:
+        if enabled:
+            # CreateKeyEx: num perfil novo a chave "Run" pode ainda não existir.
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
                 winreg.SetValueEx(key, name, 0, winreg.REG_SZ, command)
-            else:
-                try:
-                    winreg.DeleteValue(key, name)
-                except FileNotFoundError:
-                    pass
+            return True
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+                winreg.DeleteValue(key, name)
+        except FileNotFoundError:
+            pass  # sem a chave ou sem o valor: já está desligado
         return True
     except OSError:
         log.warning("Falha ao alterar a inicialização automática", exc_info=True)

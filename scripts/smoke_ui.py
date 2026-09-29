@@ -59,6 +59,15 @@ def main() -> int:
                 return found
         return None
 
+    def shown(cls):
+        """O diálogo já está na tela? No Windows o CustomTkinter esconde a janela ao criá-la e só a
+        mostra ~200 ms depois (para pintar a barra de título); fechar antes disso gera erro do Tk."""
+        widget = find(cls)
+        try:
+            return widget if widget is not None and widget.winfo_viewable() else None
+        except Exception:  # noqa: BLE001 - destruída no meio do caminho
+            return None
+
     def shot(name: str) -> None:
         app.update()
         try:
@@ -89,7 +98,7 @@ def main() -> int:
 
         print("3. Servidores e conexões: todos os servidores e conectores")
         app.open_connections("prod-web-01")
-        yield until(lambda: find(ConnectionsDialog) is not None, "diálogo Conexões")
+        yield until(lambda: shown(ConnectionsDialog), "diálogo Conexões")
         dialog = find(ConnectionsDialog)
         dialog.geometry("1080x740+40+20")
         for server in config.servers:
@@ -111,7 +120,7 @@ def main() -> int:
         tab.tables["Contêineres"].select_key("docker:shop-redis-1")
         tab._update_actions()
         tab._service_action(ServiceAction.STOP)
-        yield until(lambda: (d := find(ChangeDialog)) is not None and d.prepared is not None, "análise de risco")
+        yield until(lambda: (d := shown(ChangeDialog)) is not None and d.prepared is not None, "análise de risco")
         change = find(ChangeDialog)
         assert change.risk_badge.cget("text") not in ("ANALISANDO…", "SEM ANÁLISE"), change.risk_badge.cget("text")
         print(f"  risco: {change.risk_badge.cget('text')}")
@@ -127,7 +136,7 @@ def main() -> int:
         tab.tables["Contêineres"].select_key("docker:cloudflared")
         tab._update_actions()
         tab._service_action(ServiceAction.STOP)
-        yield until(lambda: (d := find(ChangeDialog)) is not None and d.prepared is not None, "análise do túnel")
+        yield until(lambda: (d := shown(ChangeDialog)) is not None and d.prepared is not None, "análise do túnel")
         change = find(ChangeDialog)
         assert "CRÍTICO" in change.risk_badge.cget("text").upper(), change.risk_badge.cget("text")
         assert change.run_btn.cget("state") == "disabled"
@@ -139,14 +148,14 @@ def main() -> int:
 
         print("6. novo contêiner")
         app.open_new_container("prod-web-01")
-        yield until(lambda: find(NewContainerDialog) is not None, "formulário de novo contêiner")
+        yield until(lambda: shown(NewContainerDialog), "formulário de novo contêiner")
         form = find(NewContainerDialog)
         form.fields["image"].insert(0, "nginx:1.27-alpine")
         form.fields["name"].insert(0, "web-smoke")
         form.fields["ports"].insert(0, "127.0.0.1:8089:80")
         shot("07-novo-conteiner")
         form._submit()
-        yield until(lambda: (d := find(ChangeDialog)) is not None and d.prepared is not None, "análise do novo")
+        yield until(lambda: (d := shown(ChangeDialog)) is not None and d.prepared is not None, "análise do novo")
         change = find(ChangeDialog)
         assert not change.prepared.assessment.blockers, change.prepared.assessment.blockers
         change._execute()
@@ -159,7 +168,7 @@ def main() -> int:
                                            state=ConnectionState.RECONNECTING, retry_in=30,
                                            message="Senha de monitor@10.0.10.31:22 necessária.",
                                            needs="password", needs_target="prod-db-01"))
-        yield until(lambda: find(SecretPromptDialog) is not None, "pedido de senha")
+        yield until(lambda: shown(SecretPromptDialog), "pedido de senha")
         prompt = find(SecretPromptDialog)
         shot("08-pedido-de-senha")
         prompt.entry.insert(0, "senha-de-teste")
@@ -171,7 +180,7 @@ def main() -> int:
                                            state=ConnectionState.RECONNECTING, retry_in=30,
                                            message="Sem login no Cloudflare Access.",
                                            needs="cloudflare-login", needs_target="prod-web-01"))
-        yield until(lambda: find(ConfirmDialog) is not None, "pergunta do login")
+        yield until(lambda: shown(ConfirmDialog), "pergunta do login")
         find(ConfirmDialog)._cancel()
         yield pause(0.5)
 

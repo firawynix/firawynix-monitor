@@ -389,9 +389,9 @@ class SSHClient:
         channel: paramiko.Channel | None = None
         try:
             try:
-                opened = time.monotonic()
+                opened = time.perf_counter()  # alta resolução também no Windows
                 channel = transport.open_session(timeout=timeout)
-                self._record_rtt(time.monotonic() - opened)
+                self._record_rtt(time.perf_counter() - opened)
                 channel.exec_command(cmd.wrap_remote_command(command))
                 channel.shutdown_write()  # EOF no stdin: nada fica esperando entrada
             except (paramiko.SSHException, OSError, EOFError) as exc:
