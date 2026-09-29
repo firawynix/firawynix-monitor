@@ -14,9 +14,12 @@ from core.models import (
     AlertKind,
     ConnectionEvent,
     ConnectionState,
+    ContainerImage,
+    DetectedTool,
     DiskUsage,
     HostAlertEvent,
     HostMetrics,
+    ImageUpdate,
     NetworkInfo,
     ProcessInfo,
     RuntimeResult,
@@ -35,6 +38,7 @@ from core.models import (
     ThresholdAlertEvent,
     VpsInfo,
 )
+from core.containers import Discovery, EngineData
 from core.monitor import AlertPolicy, ExponentialBackoff, MonitorManager, ThresholdPolicy, matches_patterns
 from core.ssh_client import SSHCommandTimeout, SSHConnectionError
 
@@ -200,6 +204,9 @@ class FakeClient:
 
     def list_containers(self, runtime):
         self._count(runtime.value)
+        mode = getattr(self, "server", None) and getattr(self.server, runtime.value, "auto")
+        if mode == "on" and runtime is ServiceKind.PODMAN:
+            return RuntimeResult(runtime, RuntimeState.DAEMON_DOWN, (), "Podman indisponível")
         if runtime is ServiceKind.DOCKER and self.docker_state is RuntimeState.OK:
             web = ServiceInfo(ServiceKind.DOCKER, "shop-web-1", "nginx", ServiceStatus.ACTIVE, "running", "Up",
                               group="shop")
@@ -274,6 +281,45 @@ class FakeClient:
     def take_rtt(self):
         return 12.5
 
+    def discover_engines(self):
+        self._count("discovery")
+        tools = {"docker": DetectedTool("docker", "/usr/bin/docker", "27.3.1")} \
+            if self.docker_state is RuntimeState.OK else {}
+        return Discovery(tools=tools)
+
+    def engine_inventory(self, engine_id):
+        self._count(f"inv:{engine_id}")
+        return EngineData(images=(ContainerImage(engine_id, "abc123", "nginx", "latest", 10),))
+
+    def buildah_inventory(self):
+        return (), ()
+
+    def container_op(self, service, op):
+        self.actions.append((service.name, op))
+        return ActionResult(ActionOutcome.OK, "ok")
+
+    def inspect_container(self, service):
+        return "{}"
+
+    def image_op(self, engine_id, image, op):
+        self.actions.append((engine_id, op))
+        return ActionResult(ActionOutcome.OK, "ok")
+
+    def inspect_image(self, engine_id, image):
+        return "{}"
+
+    def volume_op(self, engine_id, name, op):
+        return ActionResult(ActionOutcome.OK, "ok")
+
+    def inspect_volume(self, engine_id, name):
+        return "{}"
+
+    def check_image_update(self, image):
+        return ImageUpdate(image.reference, "atualizada")
+
+    def console_command(self, service):
+        return f"docker exec -it {service.name} sh"
+
     def fail2ban_action(self, jail, ip, ban):
         self.actions.append((jail, ip, ban))
         return ActionResult(ActionOutcome.OK, "ok")
@@ -308,6 +354,7 @@ def _manager(client, settings=None, history=None, **server_kwargs):
     server = ServerConfig(name="srv", host="h", username="u", **server_kwargs)
     settings = settings or AppSettings(poll_interval_seconds=2.0, process_limit=3)
     config = Config(settings=settings, servers=(server,))
+    client.server = server
     manager = MonitorManager(config, client_factory=lambda _s, _a: client, history=history)
     monitor = manager.monitors["srv"]
     monitor._backoff = ExponentialBackoff(base=0.01, maximum=0.05, jitter=0)
@@ -546,3 +593,49 @@ def test_monitor_checks_endpoints_in_background():
     assert snapshot.failing_endpoints() == [result]
     alerts = [e for e in events if isinstance(e, HostAlertEvent) and e.category == "endpoint"]
     assert [a.level for a in alerts] == ["critical"]  # emitido junto com o snapshot
+
+
+# ---------------------------------------------------------------------------
+# Motores de contêiner: auto-detecção e troca pelo painel
+# ---------------------------------------------------------------------------
+
+def test_discovery_gates_engines_and_feeds_the_containers_inventory():
+    client = FakeClient(docker_state=RuntimeState.OK)
+    manager = _manager(client)
+    manager.start()
+    try:
+        events = _collect(manager, lambda ev: any(s.containers and s.containers.images for s in _snapshots(ev)))
+        _collect(manager, lambda ev: _count(ev, SnapshotEvent) >= 3)
+    finally:
+        manager.stop()
+    snapshot = next(s for s in _snapshots(events) if s.containers and s.containers.images)
+    docker = snapshot.containers.engine("docker")
+    assert (docker.installed, docker.version, docker.containers) == (True, "27.3.1", 1)
+    assert snapshot.containers.engine("podman").installed is False
+    assert snapshot.containers.images[0].in_use is True  # "nginx" do contêiner = nginx:latest
+    # Podman não foi detectado: só a primeira coleta (antes da detecção) tentou listá-lo.
+    assert client.calls["podman"] == 1 and client.calls["docker"] >= 3 and client.calls["inv:docker"] >= 1
+    assert "inv:podman" not in client.calls
+
+
+def test_engine_selection_from_the_panel_switches_engines_live():
+    client = FakeClient(docker_state=RuntimeState.OK)
+    manager = _manager(client)
+    manager.start()
+    try:
+        _collect(manager, lambda ev: any(any(x.kind is ServiceKind.DOCKER for x in s.services) for s in _snapshots(ev)))
+        manager.set_engine_modes("srv", {"docker": "off", "podman": "on", "bogus": "on"})
+        assert manager.server_config("srv").docker == "off" and client.server.podman == "on"
+        events = _collect(manager, lambda ev: any(
+            not any(x.kind is ServiceKind.DOCKER for x in s.services) and "Podman indisponível" in s.warnings
+            for s in _snapshots(ev)))
+        # Motor exigido ("on") que não responde vira aviso; o Docker desligado some da tela.
+        snapshot = _snapshots(events)[-1]
+        assert snapshot.containers.engine("docker").mode == "off"
+        result = manager.container_op("srv", svc("shop-web-1", kind=ServiceKind.DOCKER), "pause").result(timeout=5)
+        assert result.outcome is ActionOutcome.OK and ("shop-web-1", "pause") in client.actions
+        updates = manager.check_image_updates("srv", [ContainerImage("docker", "1", "nginx", "1.27")]).result(5)
+        assert [u.status for u in updates] == ["atualizada"]
+        assert manager.console_command("srv", svc("web", kind=ServiceKind.DOCKER)) == "docker exec -it web sh"
+    finally:
+        manager.stop()

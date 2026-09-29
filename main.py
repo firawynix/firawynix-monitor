@@ -183,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     # Imports de UI só depois da configuração validada (inicialização mais rápida em erro).
-    from config.preferences import Preferences
+    from config.preferences import Preferences, apply_engine_preferences
     from config.settings import user_config_dir
     from core.notifier import Notifier
     from ui.dashboard import Dashboard
@@ -199,6 +199,7 @@ def main(argv: list[str] | None = None) -> int:
 
     apply_theme(settings.appearance_mode)
     preferences = Preferences(None if args.demo else user_config_dir() / "preferences.json")
+    app_config = apply_engine_preferences(app_config, preferences)
 
     history = open_history(settings, demo=args.demo)
     if args.demo and history is not None:

@@ -141,8 +141,11 @@ TYPE_FILTERS: dict[str, Callable[[ServiceInfo], bool]] = {
     "systemd: sockets": _is_unit("socket"),
     "systemd: mounts": _is_unit("mount"),
     "systemd: paths": _is_unit("path"),
+    "Contêineres (todos os motores)": lambda s: s.kind.is_container,
     "Contêineres Docker": lambda s: s.kind is ServiceKind.DOCKER,
     "Contêineres Podman": lambda s: s.kind is ServiceKind.PODMAN,
+    "Contêineres containerd": lambda s: s.kind is ServiceKind.NERDCTL,
+    "Contêineres CRI (Kubernetes)": lambda s: s.kind is ServiceKind.CRI,
     "Pods Kubernetes": lambda s: s.kind is ServiceKind.KUBERNETES,
     "Máquinas virtuais": lambda s: s.kind is ServiceKind.LIBVIRT,
     "Instâncias LXD/Incus": lambda s: s.kind is ServiceKind.LXD,
@@ -191,7 +194,7 @@ class ServicesTab(Tab):
                                                     command=lambda _v: self.refresh())
         self.status_filter.set("Todos")
         self.status_filter.grid(row=0, column=0, padx=(0, 10))
-        self.type_filter = ctk.CTkOptionMenu(toolbar, values=list(TYPE_FILTERS), width=190,
+        self.type_filter = ctk.CTkOptionMenu(toolbar, values=list(TYPE_FILTERS), width=230,
                                              dynamic_resizing=False, command=lambda _v: self.refresh())
         self.type_filter.set("Serviços e cargas")
         self.type_filter.grid(row=0, column=1, padx=(0, 10))
@@ -333,7 +336,8 @@ class StacksTab(Tab):
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         header.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(header, text="Projetos Docker/Podman Compose, pods do Podman e namespaces do Kubernetes",
+        ctk.CTkLabel(header, text="Projetos Compose (Docker, Podman, nerdctl), pods do Podman e namespaces do "
+                                  "Kubernetes",
                      text_color=GRAY, anchor="w").grid(row=0, column=0, sticky="w")
         self.count = ctk.CTkLabel(header, text="", text_color=GRAY)
         self.count.grid(row=0, column=1, sticky="e")
@@ -422,7 +426,7 @@ class StacksTab(Tab):
         if busy:
             text += f"  —  {busy}…"
         self.selection.configure(text=text, text_color=STATUS_COLORS[stack.status])
-        can_act = connected and busy is None and stack.kind.is_container
+        can_act = connected and busy is None and stack.kind.manageable
         _set_state(self.btn_start, can_act and stack.running < len(stack.members))
         _set_state(self.btn_stop, can_act and stack.running > 0)
         _set_state(self.btn_restart, can_act)
@@ -447,7 +451,7 @@ class StacksTab(Tab):
         stack = self.selected()
         if stack is None or self._server is None:
             return []
-        can_act = (self.app.manager.is_connected(self._server) and stack.kind.is_container
+        can_act = (self.app.manager.is_connected(self._server) and stack.kind.manageable
                    and self.app.busy_label(self._server, stack.key) is None)
         items = [(f"{action.label} stack", (lambda a=action: self.act(a)) if can_act else None)
                  for action in ServiceAction]
@@ -1118,8 +1122,8 @@ class OverviewPanel(ctk.CTkFrame):
             counts = snapshot.counts() if snapshot else None
             mix = "—"
             if snapshot:
-                containers = sum(snapshot.count_kind(k) for k in (ServiceKind.DOCKER, ServiceKind.PODMAN,
-                                                                   ServiceKind.LXD))
+                containers = sum(1 for s in snapshot.services if (s.kind.is_container and s.kind is not
+                                                                  ServiceKind.CRI) or s.kind is ServiceKind.LXD)
                 mix = (f"{containers} / {snapshot.count_kind(ServiceKind.KUBERNETES)} / "
                        f"{snapshot.count_kind(ServiceKind.LIBVIRT)}")
             alerts = ", ".join(snapshot.resource_alerts) if snapshot else ""

@@ -154,48 +154,71 @@ TIMERS_CMD = (
 # Docker / Podman
 # ---------------------------------------------------------------------------
 
-def _runtime(runtime: str) -> str:
-    if runtime not in ("docker", "podman"):
+#: Motores com CLI no formato do Docker (os mesmos comandos servem para os três).
+CLI_RUNTIMES = ("docker", "podman", "nerdctl")
+_NAMESPACE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+
+
+def validate_namespace(namespace: str) -> str:
+    if not isinstance(namespace, str) or not _NAMESPACE_RE.fullmatch(namespace):
+        raise ValueError(f"Namespace do containerd inválido: {namespace!r}")
+    return namespace
+
+
+def container_cli(runtime: str, use_sudo: bool, namespace: str = "") -> str:
+    """``docker`` / ``podman`` / ``nerdctl [--namespace ns]``, com ``sudo -n`` se pedido."""
+    if runtime not in CLI_RUNTIMES:
         raise ValueError(f"Runtime inválido: {runtime!r}")
-    return runtime
+    prefix = f"{sudo(use_sudo)}{runtime}"
+    if runtime == "nerdctl" and namespace:
+        prefix += f" --namespace {shlex.quote(validate_namespace(namespace))}"
+    return prefix
 
 
-def build_container_ps_command(runtime: str, use_sudo: bool) -> str:
-    if _runtime(runtime) == "podman":
-        return f"{sudo(use_sudo)}podman ps -a --format json"
-    return f"{sudo(use_sudo)}docker ps -a --format '{{{{json .}}}}'"
+def build_container_ps_command(runtime: str, use_sudo: bool, namespace: str = "") -> str:
+    base = container_cli(runtime, use_sudo, namespace)
+    if runtime == "podman":
+        return f"{base} ps -a --format json"
+    return f"{base} ps -a --format '{{{{json .}}}}'"
 
 
-def build_container_stats_command(runtime: str, use_sudo: bool) -> str:
+def build_container_stats_command(runtime: str, use_sudo: bool, namespace: str = "") -> str:
     # "|" como separador: não aparece em nomes de contêiner e dispensa escapes.
     fmt = "'{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}'"
-    return f"{sudo(use_sudo)}{_runtime(runtime)} stats --no-stream --format {fmt}"
+    return f"{container_cli(runtime, use_sudo, namespace)} stats --no-stream --format {fmt}"
 
 
 def build_container_action_command(runtime: str, names: Sequence[str], action: ServiceAction,
-                                   use_sudo: bool) -> str:
+                                   use_sudo: bool, namespace: str = "") -> str:
     """Aceita vários contêineres (ações em uma stack inteira em um só comando)."""
     if not names:
         raise ValueError("Nenhum contêiner informado")
     quoted = " ".join(shlex.quote(validate_container_name(n)) for n in names)
     # -t 3: no máximo 3 s de espera pelo SIGTERM antes do SIGKILL (cabe no timeout).
     stop_timeout = "" if action is ServiceAction.START else " -t 3"
-    return f"{sudo(use_sudo)}{_runtime(runtime)} {action.value}{stop_timeout} {quoted}"
+    return f"{container_cli(runtime, use_sudo, namespace)} {action.value}{stop_timeout} {quoted}"
 
 
-def build_container_logs_command(runtime: str, name: str, lines: int, use_sudo: bool) -> str:
+def build_container_logs_command(runtime: str, name: str, lines: int, use_sudo: bool, namespace: str = "") -> str:
     quoted = shlex.quote(validate_container_name(name))
-    return f"{sudo(use_sudo)}{_runtime(runtime)} logs --tail {int(lines)} --timestamps {quoted} 2>&1"
+    return f"{container_cli(runtime, use_sudo, namespace)} logs --tail {int(lines)} --timestamps {quoted} 2>&1"
 
 
-def build_stack_logs_command(runtime: str, names: Sequence[str], lines: int, use_sudo: bool) -> str:
+def build_stack_logs_command(runtime: str, names: Sequence[str], lines: int, use_sudo: bool,
+                             namespace: str = "") -> str:
     """Logs de todos os contêineres de uma stack, com cabeçalho por contêiner."""
+    base = container_cli(runtime, use_sudo, namespace)
     parts = []
     for name in names:
         quoted = shlex.quote(validate_container_name(name))
-        parts.append(f"printf '===== %s =====\\n' {quoted}; "
-                     f"{sudo(use_sudo)}{_runtime(runtime)} logs --tail {int(lines)} --timestamps {quoted} 2>&1")
+        parts.append(f"printf '===== %s =====\\n' {quoted}; {base} logs --tail {int(lines)} --timestamps {quoted} 2>&1")
     return "; ".join(parts)
+
+
+def build_cri_logs_command(container_id: str, lines: int, use_sudo: bool) -> str:
+    if not re.fullmatch(r"[0-9a-f]{12,64}", container_id or ""):
+        raise ValueError(f"ID de contêiner CRI inválido: {container_id!r}")
+    return f"{sudo(use_sudo)}crictl logs --tail {int(lines)} --timestamps {container_id} 2>&1"
 
 
 # ---------------------------------------------------------------------------

@@ -218,18 +218,26 @@ _EXIT_CODE_RE = re.compile(r"\((-?\d+)\)")
 COMPOSE_PROJECT_LABELS = ("com.docker.compose.project", "io.podman.compose.project")
 
 
-def classify_container(state: str, status_text: str) -> ServiceStatus:
+def container_state(state: str, status_text: str) -> str:
+    """Estado do contêiner; sem ``.State`` (Docker antigo, nerdctl) deduz pelo texto do Status
+    ("Up 2 hours", "Up", "Paused", "Exited (0) …", "Created")."""
     state = (state or "").lower()
+    if state:
+        return state
     status_lower = (status_text or "").lower()
-    if not state:
-        # Versões antigas não expõem .State: deduz pelo texto.
-        for prefix, derived in (("up", "running"), ("exited", "exited"), ("restarting", "restarting"),
-                                ("created", "created"), ("dead", "dead"), ("removal", "removing")):
-            if status_lower.startswith(prefix):
-                state = derived
-                break
-        if "(paused)" in status_lower:
-            state = "paused"
+    if "(paused)" in status_lower:
+        return "paused"
+    for prefix, derived in (("up", "running"), ("exited", "exited"), ("restarting", "restarting"),
+                            ("created", "created"), ("dead", "dead"), ("removal", "removing"),
+                            ("paused", "paused"), ("stopped", "exited")):
+        if status_lower.startswith(prefix):
+            return derived
+    return ""
+
+
+def classify_container(state: str, status_text: str) -> ServiceStatus:
+    state = container_state(state, status_text)
+    status_lower = (status_text or "").lower()
 
     code_match = _EXIT_CODE_RE.search(status_text or "")
     exit_code = int(code_match.group(1)) if code_match else None
@@ -280,7 +288,29 @@ def _container_meta(labels: dict[str, str]) -> tuple[str, tuple[tuple[str, str],
     return group, tuple(meta)
 
 
-def parse_docker_ps(output: str) -> list[ServiceInfo]:
+def _podman_ports(ports) -> str:
+    """Portas do ``podman ps`` (lista de dicts) no mesmo texto do Docker: ``0.0.0.0:8080->80/tcp``."""
+    if isinstance(ports, str):
+        return ports
+    parts = []
+    for port in ports or []:
+        if not isinstance(port, dict):
+            continue
+        host_port = port.get("host_port") or port.get("hostPort")
+        container_port = port.get("container_port") or port.get("containerPort")
+        protocol = port.get("protocol", "tcp")
+        if container_port is None:
+            continue
+        if host_port:
+            host_ip = port.get("host_ip") or port.get("hostIP") or "0.0.0.0"
+            parts.append(f"{host_ip}:{host_port}->{container_port}/{protocol}")
+        else:
+            parts.append(f"{container_port}/{protocol}")
+    return ", ".join(parts)
+
+
+def parse_docker_ps(output: str, kind: ServiceKind = ServiceKind.DOCKER) -> list[ServiceInfo]:
+    """``docker ps`` / ``nerdctl ps`` com ``--format '{{json .}}'`` (uma linha JSON por contêiner)."""
     containers: list[ServiceInfo] = []
     for line in output.splitlines():
         line = line.strip()
@@ -294,11 +324,13 @@ def parse_docker_ps(output: str) -> list[ServiceInfo]:
         name = str(item.get("Names") or item.get("ID") or "").split(",")[0].strip().lstrip("/")
         if not name:
             continue
-        state = str(item.get("State") or "")
         status_text = str(item.get("Status") or "")
+        state = container_state(str(item.get("State") or ""), status_text)
         group, meta = _container_meta(parse_docker_labels(str(item.get("Labels") or "")))
+        meta += tuple((key, str(item[field])) for key, field in (("ports", "Ports"), ("id", "ID"))
+                      if item.get(field))
         containers.append(ServiceInfo(
-            kind=ServiceKind.DOCKER,
+            kind=kind,
             name=name,
             description=str(item.get("Image") or ""),
             status=classify_container(state, status_text),
@@ -337,6 +369,9 @@ def parse_podman_ps(output: str) -> list[ServiceInfo]:
         if not group and item.get("PodName"):
             group = str(item["PodName"])
             meta += (("pod", group),)
+        ports = _podman_ports(item.get("Ports"))
+        meta += tuple((key, value) for key, value in (("ports", ports), ("id", str(item.get("Id") or "")[:12]),
+                                                      ("image_id", str(item.get("ImageID") or "")[:12])) if value)
         containers.append(ServiceInfo(
             kind=ServiceKind.PODMAN,
             name=name,
@@ -555,7 +590,7 @@ def classify_runtime_error(kind: ServiceKind, exit_code: int, output: str) -> tu
         return RuntimeState.NOT_INSTALLED, f"{label} não instalado neste host."
     if "a password is required" in lower or "a terminal is required" in lower:
         return RuntimeState.PERMISSION, f"sudo exige senha para o {label}; configure NOPASSWD no sudoers."
-    if kind.is_container:
+    if kind in (ServiceKind.DOCKER, ServiceKind.PODMAN):
         if "permission denied" in lower:
             return RuntimeState.PERMISSION, (
                 f"Sem permissão no socket do {label}. Adicione o usuário ao grupo apropriado "
@@ -571,6 +606,14 @@ def classify_runtime_error(kind: ServiceKind, exit_code: int, output: str) -> tu
             return RuntimeState.PERMISSION, f"Sem permissão no cluster: {first_line}"
         if "connection to the server" in lower or "unable to connect to the server" in lower:
             return RuntimeState.DAEMON_DOWN, f"API do Kubernetes inacessível: {first_line}"
+    elif kind in (ServiceKind.NERDCTL, ServiceKind.CRI):
+        flag = "nerdctl_sudo" if kind is ServiceKind.NERDCTL else "cri_sudo"
+        if "permission denied" in lower or "rootless" in lower and "not running" in lower:
+            return RuntimeState.PERMISSION, (f"Sem permissão no socket do {label}. Use containerd rootless ou "
+                                             f"habilite \"{flag}\" (com NOPASSWD no sudoers).")
+        if ("no such file" in lower or "connection refused" in lower or "failed to connect" in lower
+                or "cannot access containerd socket" in lower or "connect: " in lower):
+            return RuntimeState.DAEMON_DOWN, f"O serviço do {label} não está acessível."
     elif kind is ServiceKind.LXD:
         if "permission denied" in lower or "needed permissions" in lower:
             return RuntimeState.PERMISSION, ("Sem permissão no LXD/Incus. Adicione o usuário ao grupo 'lxd' "

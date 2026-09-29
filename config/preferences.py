@@ -44,3 +44,20 @@ class Preferences:
             os.replace(temporary, self.path)
         except OSError:
             log.warning("Falha ao salvar preferências em %s", self.path, exc_info=True)
+
+
+def engine_preference_key(server: str) -> str:
+    return f"engines.{server}"
+
+
+def apply_engine_preferences(config, preferences: Preferences):
+    """Aplica a escolha de motores feita no painel sobre o servers.json."""
+    import dataclasses
+
+    from core.containers import selection_to_modes
+
+    servers = []
+    for server in config.servers:
+        modes = selection_to_modes(preferences.get(engine_preference_key(server.name)))
+        servers.append(dataclasses.replace(server, **modes) if modes else server)
+    return dataclasses.replace(config, servers=tuple(servers))

@@ -35,6 +35,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Protocol
 
 from config.settings import AppSettings, Config, NotificationSettings, ServerConfig, ThresholdSettings, user_data_dir
+from core import containers as engines
 from core import security as security_rules
 from core import winapi
 from core.alerts import HostAlertPolicy
@@ -45,6 +46,7 @@ from core.models import (
     ActionResult,
     ActionResultEvent,
     AlertKind,
+    ContainerImage,
     ConnectionEvent,
     ConnectionState,
     CronEntry,
@@ -52,6 +54,7 @@ from core.models import (
     Fail2banJail,
     HostMetrics,
     HostSnapshot,
+    ImageUpdate,
     JournalEntry,
     MonitorEvent,
     NetworkInfo,
@@ -135,6 +138,17 @@ class HostClient(Protocol):
     def sudo_log(self) -> tuple[SudoEvent, ...]: ...
     def take_rtt(self) -> float | None: ...
     def fail2ban_action(self, jail: str, ip: str, ban: bool) -> ActionResult: ...
+    def discover_engines(self) -> engines.Discovery: ...
+    def engine_inventory(self, engine_id: str) -> engines.EngineData: ...
+    def buildah_inventory(self) -> tuple: ...
+    def container_op(self, service: ServiceInfo, op: str) -> ActionResult: ...
+    def inspect_container(self, service: ServiceInfo) -> str: ...
+    def image_op(self, engine_id: str, image: ContainerImage | None, op: str) -> ActionResult: ...
+    def inspect_image(self, engine_id: str, image: ContainerImage) -> str: ...
+    def volume_op(self, engine_id: str, name: str, op: str) -> ActionResult: ...
+    def inspect_volume(self, engine_id: str, name: str) -> str: ...
+    def check_image_update(self, image: ContainerImage) -> ImageUpdate: ...
+    def console_command(self, service: ServiceInfo) -> str: ...
     def service_action(self, service: ServiceInfo, action: ServiceAction) -> ActionResult: ...
     def stack_action(self, stack: Stack, action: ServiceAction) -> ActionResult: ...
     def kill_process(self, pid: int, force: bool) -> ActionResult: ...
@@ -185,9 +199,11 @@ class ExponentialBackoff:
 # Regras de criticidade e alertas
 # ---------------------------------------------------------------------------
 
-_KIND_PREFIXES = {kind.value for kind in ServiceKind} | {"kubernetes", "libvirt", "incus", "lxc"}
 _PREFIX_ALIASES = {"kubernetes": ServiceKind.KUBERNETES.value, "libvirt": ServiceKind.LIBVIRT.value,
-                   "incus": ServiceKind.LXD.value, "lxc": ServiceKind.LXD.value}
+                   "incus": ServiceKind.LXD.value, "lxc": ServiceKind.LXD.value,
+                   "containerd": ServiceKind.NERDCTL.value, "crio": ServiceKind.CRI.value,
+                   "cri-o": ServiceKind.CRI.value}
+_KIND_PREFIXES = {kind.value for kind in ServiceKind} | set(_PREFIX_ALIASES)
 
 
 def matches_patterns(service: ServiceInfo, patterns: Iterable[str]) -> bool:
@@ -342,6 +358,11 @@ class _Latest:
     logins: SshLoginReport | None = None
     sudo: tuple[SudoEvent, ...] = ()
     endpoints: list[EndpointResult] = dataclasses.field(default_factory=list)
+    discovery: engines.Discovery | None = None
+    discovered_at: float | None = None
+    engine_data: dict[str, engines.EngineData] = dataclasses.field(default_factory=dict)
+    buildah: tuple | None = None
+    containers_at: float | None = None
     latency_ms: float | None = None
     latency_method: str = ""
     detail_at: float | None = None
@@ -350,8 +371,10 @@ class _Latest:
     endpoints_at: float | None = None
 
 
-_RUNTIME_KINDS = (ServiceKind.DOCKER, ServiceKind.PODMAN, ServiceKind.KUBERNETES, ServiceKind.LIBVIRT,
-                  ServiceKind.LXD)
+_RUNTIME_KINDS = (ServiceKind.DOCKER, ServiceKind.PODMAN, ServiceKind.NERDCTL, ServiceKind.CRI,
+                  ServiceKind.KUBERNETES, ServiceKind.LIBVIRT, ServiceKind.LXD)
+_STATS_KINDS = (ServiceKind.DOCKER, ServiceKind.PODMAN, ServiceKind.NERDCTL)
+_INVENTORY_ENGINES = ("docker", "podman", "nerdctl", "cri")
 
 
 class ServerMonitor:
@@ -387,8 +410,11 @@ class ServerMonitor:
         self._auth_backoff = ExponentialBackoff(base=30.0, maximum=600.0)
         self._previous: dict[str, ServiceInfo] | None = None
         self._latest = _Latest()
-        self._due = {"detail": 0.0, "inventory": 0.0, "updates": 0.0, "security": 0.0, "endpoints": 0.0}
+        self._due = {"detail": 0.0, "inventory": 0.0, "updates": 0.0, "security": 0.0, "endpoints": 0.0,
+                     "containers": 0.0}
         self._runtime_skip: dict[ServiceKind, int] = defaultdict(int)
+        #: Motores que já funcionaram nesta sessão (se pararem, é problema real).
+        self._seen_ok: set[ServiceKind] = set()
         self._consecutive_timeouts = 0
         self.state = ConnectionState.STOPPED
 
@@ -425,6 +451,15 @@ class ServerMonitor:
     def set_interval(self, seconds: float) -> None:
         self.interval = seconds
         self._wake.set()
+
+    def set_engine_modes(self, modes: Mapping[str, str]) -> None:
+        """Troca os motores de contêiner em uso (diálogo "Motores de contêiner")."""
+        server = dataclasses.replace(self.server, **{k: v for k, v in modes.items() if k in engines.ENGINES})
+        self.server = server
+        if hasattr(self.client, "server"):
+            self.client.server = server
+        self._runtime_skip.clear()
+        self.refresh_now(full=True)
 
     def reconnect(self) -> None:
         """Reconecta já (ex.: credencial atualizada), sem esperar o backoff de autenticação."""
@@ -507,8 +542,13 @@ class ServerMonitor:
             "metrics": client.host_metrics,
         }
         for kind in _RUNTIME_KINDS:
+            engine_id = engines.ENGINE_OF_KIND.get(kind)
             if self._runtime_mode(kind) == "off":
                 self._latest.runtimes[kind] = RuntimeResult(kind, RuntimeState.DISABLED)
+            elif engine_id and not self._engine_allowed(engine_id):
+                # Auto-detecção: o motor não existe neste host (nada é executado).
+                self._latest.runtimes[kind] = RuntimeResult(kind, RuntimeState.NOT_INSTALLED, (),
+                                                            f"{kind.label} não detectado neste host.")
             elif self._runtime_skip[kind] > 0:
                 self._runtime_skip[kind] -= 1
             elif kind.is_container:
@@ -527,7 +567,7 @@ class ServerMonitor:
             self._due["detail"] = now + settings.detail_interval_seconds
             tasks["processes"] = client.processes
             tasks["network"] = client.network
-        for kind in (ServiceKind.DOCKER, ServiceKind.PODMAN):
+        for kind in _STATS_KINDS:
             runtime = self._latest.runtimes.get(kind)
             # Stats também no ciclo seguinte à descoberta do runtime (sem esperar o intervalo).
             if runtime is not None and runtime.state is RuntimeState.OK and runtime.items \
@@ -536,11 +576,21 @@ class ServerMonitor:
         if now >= self._due["inventory"]:
             self._due["inventory"] = now + settings.inventory_interval_seconds
             events = settings.events
+            tasks["discovery"] = client.discover_engines
             tasks["system"] = client.system_info
             tasks["vps"] = client.vps_info
             tasks["timers"] = client.timers
             tasks["cron"] = client.cron
             tasks["events"] = (lambda: client.journal_events(events.priority, events.limit, events.since_hours))
+        # Imagens/volumes/redes: só depois que a auto-detecção disse quais motores existem.
+        if now >= self._due["containers"] and self._latest.discovery is not None:
+            self._due["containers"] = now + settings.inventory_interval_seconds
+            for engine_id in _INVENTORY_ENGINES:
+                runtime = self._latest.runtimes.get(engines.ENGINES[engine_id].kind)
+                if runtime is not None and runtime.state is RuntimeState.OK and self._engine_allowed(engine_id):
+                    tasks[f"inv:{engine_id}"] = (lambda e=engine_id: client.engine_inventory(e))
+            if self._engine_ready("buildah"):
+                tasks["buildah"] = client.buildah_inventory
         if now >= self._due["updates"]:
             self._due["updates"] = now + settings.updates_interval_seconds
             tasks["updates"] = client.updates
@@ -583,13 +633,39 @@ class ServerMonitor:
                                  self._endpoint_specs))
 
     def _runtime_mode(self, kind: ServiceKind) -> str:
-        return {
-            ServiceKind.DOCKER: self.server.docker,
-            ServiceKind.PODMAN: self.server.podman,
-            ServiceKind.KUBERNETES: self.server.kubernetes,
-            ServiceKind.LIBVIRT: self.server.libvirt,
-            ServiceKind.LXD: self.server.lxd,
-        }[kind]
+        engine_id = engines.ENGINE_OF_KIND.get(kind)
+        if engine_id:
+            return engines.engine_mode(self.server, engine_id)
+        return {ServiceKind.KUBERNETES: self.server.kubernetes, ServiceKind.LIBVIRT: self.server.libvirt}[kind]
+
+    def _runtime_warns(self, kind: ServiceKind, runtime: RuntimeResult) -> bool:
+        """Aviso na faixa amarela: motor exigido ("on"), ou que funcionava e parou.
+
+        Em "auto", um motor instalado mas nunca usado neste servidor (ex.: CLI do
+        Docker que sobrou depois da troca para o Podman) não gera aviso: o estado
+        aparece só na aba Contêineres.
+        """
+        if runtime.state is RuntimeState.OK:
+            return False
+        if self._runtime_mode(kind) == "on":
+            return True
+        if runtime.state is RuntimeState.DAEMON_DOWN:
+            return kind in self._seen_ok
+        return runtime.state is RuntimeState.PERMISSION and kind is not ServiceKind.CRI
+
+    def _engine_allowed(self, engine_id: str) -> bool:
+        """"on" sempre; "auto" enquanto não houver detecção ou se ela encontrou o binário."""
+        mode = engines.engine_mode(self.server, engine_id)
+        if mode == "off":
+            return False
+        discovery = self._latest.discovery
+        return mode == "on" or discovery is None or discovery.has(engine_id)
+
+    def _engine_ready(self, engine_id: str) -> bool:
+        """Ferramentas sem daemon (Buildah): só com detecção positiva ou modo "on"."""
+        mode = engines.engine_mode(self.server, engine_id)
+        discovery = self._latest.discovery
+        return mode == "on" or (mode == "auto" and discovery is not None and discovery.has(engine_id))
 
     def _collect(self) -> HostSnapshot:
         started = time.monotonic()
@@ -648,8 +724,11 @@ class ServerMonitor:
             runtime = results.get(kind.value)
             if isinstance(runtime, RuntimeResult):
                 latest.runtimes[kind] = runtime
-                if runtime.state in (RuntimeState.NOT_INSTALLED, RuntimeState.DAEMON_DOWN) \
-                        and self._runtime_mode(kind) == "auto":
+                if runtime.state is RuntimeState.OK:
+                    self._seen_ok.add(kind)
+                quiet = runtime.state in (RuntimeState.NOT_INSTALLED, RuntimeState.DAEMON_DOWN) or (
+                    kind is ServiceKind.CRI and runtime.state is RuntimeState.PERMISSION)
+                if quiet and self._runtime_mode(kind) == "auto":
                     self._runtime_skip[kind] = RUNTIME_RECHECK_POLLS
             stats = results.get(f"stats:{kind.value}")
             if isinstance(stats, dict):
@@ -678,6 +757,17 @@ class ServerMonitor:
         if isinstance(results.get("endpoints"), list):
             latest.endpoints = results["endpoints"]
             latest.endpoints_at = now
+        if isinstance(results.get("discovery"), engines.Discovery):
+            if latest.discovery is None:
+                self._due["containers"] = 0.0  # inventário logo no ciclo seguinte
+            latest.discovery, latest.discovered_at = results["discovery"], now
+        for engine_id in _INVENTORY_ENGINES:
+            data = results.get(f"inv:{engine_id}")
+            if isinstance(data, engines.EngineData):
+                latest.engine_data[engine_id] = data
+                latest.containers_at = now
+        if isinstance(results.get("buildah"), tuple):
+            latest.buildah = results["buildah"]
         self._apply_latency(results)
         for name in ("timers", "cron", "events"):
             if isinstance(results.get(name), list):
@@ -744,10 +834,7 @@ class ServerMonitor:
                 if item.name in stats and item.status is ServiceStatus.ACTIVE else item
                 for item in runtime.items
             ]
-            mode = self._runtime_mode(kind)
-            if runtime.message and (
-                    (mode == "on" and runtime.state is not RuntimeState.OK)
-                    or runtime.state in (RuntimeState.PERMISSION, RuntimeState.DAEMON_DOWN)):
+            if runtime.message and self._runtime_warns(kind, runtime):
                 warnings.append(runtime.message)
 
         visible = [
@@ -771,6 +858,11 @@ class ServerMonitor:
         if smart is not None and smart.state is RuntimeState.NOT_INSTALLED and self.server.smart == "on":
             warnings.append(smart.message)
         security = self._security_report(system)
+        containers = engines.build_inventory(
+            self.server, latest.discovery, latest.runtimes,
+            {e: d for e, d in latest.engine_data.items() if self._engine_allowed(e)},
+            latest.buildah if self._engine_ready("buildah") else None, visible,
+            latest.discovered_at, latest.containers_at)
 
         if evaluate:
             for alert in self.policy.evaluate(self.server.name, self._previous, visible):
@@ -804,6 +896,7 @@ class ServerMonitor:
             smart=smart,
             security=security,
             endpoints=tuple(latest.endpoints),
+            containers=containers,
             latency_ms=latest.latency_ms,
             latency_method=latest.latency_method,
             warnings=tuple(dict.fromkeys(w for w in warnings if w)),
@@ -823,6 +916,10 @@ _TASK_LABELS = {
     "system": "sistema", "vps": "VPS", "timers": "timers", "cron": "cron", "events": "eventos do journal",
     "updates": "atualizações", "security": "auditoria de segurança", "ssh_logins": "logins SSH",
     "sudo_log": "log do sudo", "fail2ban": "fail2ban", "smart": "SMART", "icmp": "ping ICMP",
+    "nerdctl": "containerd (nerdctl)", "cri": "CRI (crictl)", "discovery": "auto-detecção de motores",
+    "inv:docker": "imagens/volumes do Docker", "inv:podman": "imagens/volumes do Podman",
+    "inv:nerdctl": "imagens/volumes do containerd", "inv:cri": "imagens do CRI", "buildah": "Buildah",
+    "stats:nerdctl": "stats do containerd",
 }
 
 
@@ -915,6 +1012,59 @@ class MonitorManager:
         label = "Forçar encerramento" if force else "Encerrar"
         return self._submit_action(server, f"PID {pid}", label, f"pid:{pid}",
                                    lambda client: client.kill_process(pid, force))
+
+    # -- motores de contêiner -------------------------------------------------
+
+    def set_engine_modes(self, server: str, modes: Mapping[str, str]) -> None:
+        self.monitors[server].set_engine_modes(modes)
+
+    def server_config(self, server: str) -> ServerConfig:
+        """Configuração em vigor (pode ter sido alterada pelo diálogo de motores)."""
+        return self.monitors[server].server
+
+    def container_op(self, server: str, service: ServiceInfo, op: str) -> Future[ActionResult]:
+        label = {"pause": "Pausar", "unpause": "Retomar", "rm": "Remover"}.get(op, op)
+        return self._submit_action(server, service.name, label, service.key,
+                                   lambda client: client.container_op(service, op))
+
+    def image_op(self, server: str, engine_id: str, image: ContainerImage | None, op: str) -> Future[ActionResult]:
+        target = image.reference if image else engines.ENGINES[engine_id].label
+        busy = f"image:{image.key}" if image else f"prune:{engine_id}"
+        label = {"rmi": "Remover imagem", "prune": "Limpar imagens órfãs"}.get(op, op)
+        return self._submit_action(server, target, label, busy, lambda client: client.image_op(engine_id, image, op))
+
+    def volume_op(self, server: str, engine_id: str, name: str, op: str) -> Future[ActionResult]:
+        return self._submit_action(server, name, "Remover volume", f"volume:{engine_id}:{name}",
+                                   lambda client: client.volume_op(engine_id, name, op))
+
+    def inspect(self, server: str, what: str, engine_id: str, target) -> Future[str]:
+        """``what``: "container" (ServiceInfo), "image" (ContainerImage) ou "volume" (nome)."""
+        calls = {"container": lambda c: c.inspect_container(target),
+                 "image": lambda c: c.inspect_image(engine_id, target),
+                 "volume": lambda c: c.inspect_volume(engine_id, target)}
+        return self._submit_read(server, calls[what])
+
+    def check_image_updates(self, server: str, images: Sequence[ContainerImage]) -> Future[list[ImageUpdate]]:
+        """Uma consulta skopeo por imagem (cada uma limitada a 5 s), em segundo plano."""
+        monitor = self.monitors[server]
+
+        def task() -> list[ImageUpdate]:
+            if not monitor.client.connected:
+                raise SSHConnectionError(f"{server} está desconectado")
+            results = []
+            for image in images:
+                try:
+                    results.append(monitor.client.check_image_update(image))
+                except SSHConnectionError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - uma imagem com erro não interrompe as demais
+                    results.append(ImageUpdate(image.reference, "erro", detail=str(exc)[:200]))
+            return results
+
+        return self._executor.submit(task)
+
+    def console_command(self, server: str, service: ServiceInfo) -> str:
+        return self.monitors[server].client.console_command(service)
 
     def fail2ban_action(self, server: str, jail: str, ip: str, ban: bool) -> Future[ActionResult]:
         label = "Banir" if ban else "Desbanir"

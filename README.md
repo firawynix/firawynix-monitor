@@ -2,7 +2,9 @@
 
 Aplicação desktop para **Windows** (tema **ciano**, claro ou escuro) que monitora e
 gerencia, em tempo real, servidores Linux e **VPS**: serviços e demais unidades
-**systemd**, contêineres **Docker**, **Podman** e **LXD/Incus**, stacks do **Compose**,
+**systemd**, contêineres de **qualquer motor** — **Docker**, **Podman**, **containerd**
+(nerdctl), **CRI-O** (crictl), **Buildah**, **Skopeo** e **LXD/Incus**, com
+**auto-detecção** e o mesmo painel para todos —, stacks do **Compose**,
 pods **Kubernetes** (inclusive k3s/microk8s), **VMs libvirt/KVM**, processos, portas,
 agendamentos, eventos do journal, **auditoria de segurança** (SSH, firewall, fail2ban,
 logins, sudo), **saúde dos discos (SMART)**, **sites e certificados TLS**, franquia de
@@ -18,7 +20,8 @@ energia e ICMP).
 | Área | O que faz |
 |---|---|
 | **Visão geral** | Todos os servidores lado a lado (saúde, CPU, memória, disco, load, rede, **latência**, uptime, cargas ativas/falhas, contêineres/pods/VMs, **nota de segurança**, alertas) e uma lista única de **problemas em todos os servidores** (cargas, endpoints fora do ar, discos com SMART ruim, falhas críticas de segurança); duplo clique leva ao item |
-| **Serviços** | Unidades systemd (`service`, `timer`, `socket`, `mount`, `path`), contêineres Docker/Podman, **instâncias LXD/Incus** (contêineres e VMs), pods Kubernetes e VMs libvirt em uma só tabela, com CPU/memória por serviço (cgroup v2), por contêiner (`stats`) e por instância LXD; filtros por status e tipo, busca e ordenação |
+| **Contêineres** | Painel próprio e **idêntico para qualquer motor** (Docker, Podman, containerd/nerdctl, CRI-O/containerd via crictl, Buildah, Skopeo): **auto-detecção** dos motores instalados (versão, rootless, estado do daemon) ou escolha manual no botão **Motores…**; contêineres com imagem, portas, stack/pod, CPU e memória; **imagens** (tamanho, uso, órfãs) com **verificação de atualizações no registro via Skopeo** (sem baixar nada); **volumes** (em uso ou não), **redes** (sub-redes, contêineres), **builds do Buildah** e **uso de disco** (`system df`). Ações: iniciar/parar/reiniciar, **pausar/retomar**, logs, **console** (shell no contêiner via `ssh -t`), inspecionar e — com `container_admin` — remover contêineres parados, imagens, volumes e **limpar imagens órfãs**. Painéis web de terceiros (**Portainer**, Cockpit, Dockge, Yacht, Dozzle, Rancher, Watchtower) são **detectados** e abertos no navegador, sem mudar o layout |
+| **Serviços** | Unidades systemd (`service`, `timer`, `socket`, `mount`, `path`), contêineres de todos os motores, **instâncias LXD/Incus** (contêineres e VMs), pods Kubernetes e VMs libvirt em uma só tabela, com CPU/memória por serviço (cgroup v2), por contêiner (`stats`) e por instância LXD; filtros por status e tipo, busca e ordenação |
 | **Stacks** | Projetos do Docker/Podman **Compose**, pods do Podman e namespaces do Kubernetes, com status agregado (ativo/degradado/falha), membros, diretório/arquivos do Compose e ações na stack inteira |
 | **Processos** | Top N por CPU (CPU instantânea via `/proc`), memória, RSS, tempo, linha de comando; encerrar com TERM/KILL (desativado por padrão) |
 | **Rede** | Taxas por interface (física/virtual), portas em escuta com processo e exposição (todas as interfaces / local), conexões TCP/UDP |
@@ -33,6 +36,10 @@ energia e ICMP).
 | **API do Windows** | Senhas SSH no **Gerenciador de Credenciais** (DPAPI), alertas e ações no **Visualizador de Eventos**, **barra de título** na cor do tema (Windows 11), **piscar a barra de tarefas** em alertas críticos, **iniciar com o Windows**, **impedir a suspensão** e **ping ICMP** sem administrador |
 | **Exportação** | Qualquer tabela para CSV (botão direito → *Exportar tabela*), pronto para o Excel |
 | **Resiliência** | Uma thread por servidor, coletores em paralelo, reconexão com *exponential backoff*, **timeout máximo de 5 s por comando**, keepalive e watchdog; endpoints verificados em segundo plano |
+
+| Contêineres (Docker + Portainer detectado) | Imagens (atualizações via Skopeo) | Motores: auto-detectar ou escolher |
+|---|---|---|
+| ![Contêineres](docs/screenshot-conteineres.png) | ![Imagens](docs/screenshot-imagens.png) | ![Motores](docs/screenshot-motores.png) |
 
 | Visão geral | Segurança | VPS |
 |---|---|---|
@@ -53,6 +60,8 @@ firawynix-monitor/
 ├── core/
 │   ├── models.py           # dataclasses imutáveis (cargas, stacks, métricas, VPS, segurança, eventos)
 │   ├── commands.py         # construtores de comandos remotos (validação + shlex.quote + sudo -n)
+│   ├── containers.py       # motores de contêiner: registro, auto-detecção, adaptadores (docker, podman,
+│   │                       #   nerdctl, crictl, buildah, skopeo), inventário unificado, painéis de terceiros
 │   ├── parsers.py          # parsers de systemctl, docker/podman, incus/lxc, kubectl, virsh, /proc, ss,
 │   │                       #   sshd, fail2ban, journal, smartctl, vnStat, cron…
 │   ├── security.py         # regras da auditoria de segurança e nota 0–100
@@ -67,6 +76,8 @@ firawynix-monitor/
 ├── ui/
 │   ├── dashboard.py        # janela principal, cartões, eventos, alertas, bandeja, terminal
 │   ├── tabs.py             # Serviços, Stacks, Processos, Rede, Agendamentos, Eventos, Sistema, Histórico
+│   ├── containers_tab.py   # aba Contêineres (a mesma para qualquer motor)
+│   ├── engines_dialog.py   # diálogo "Motores…" (auto-detectar ou escolher)
 │   ├── vps_tab.py          # aba VPS (provedor, NTP, tráfego, endpoints)
 │   ├── security_tab.py     # aba Segurança (nota, verificações, fail2ban, logins, sudo, chaves)
 │   ├── options.py          # diálogo "Windows ⚙" (integrações e credenciais)
@@ -89,9 +100,9 @@ que estiverem vencidos. Cada comando continua limitado a 5 s.
 
 | Camada | Frequência (padrão) | O que coleta |
 |---|---|---|
-| Rápida | `poll_interval_seconds` (5 s) | unidades systemd, CPU/memória por serviço (cgroup v2), Docker, Podman, LXD/Incus, pods, VMs, métricas do host (CPU, steal, iowait, load, memória, discos, rede, E/S) e latência |
-| Detalhes | `detail_interval_seconds` (15 s) | processos, portas, `docker/podman stats` |
-| Inventário | `inventory_interval_seconds` (60 s) | sistema, VPS (provedor, NTP, DNS, OOM killer, vnStat), timers, cron, eventos do journal |
+| Rápida | `poll_interval_seconds` (5 s) | unidades systemd, CPU/memória por serviço (cgroup v2), contêineres de cada motor detectado, LXD/Incus, pods, VMs, métricas do host (CPU, steal, iowait, load, memória, discos, rede, E/S) e latência |
+| Detalhes | `detail_interval_seconds` (15 s) | processos, portas, `stats` dos contêineres |
+| Inventário | `inventory_interval_seconds` (60 s) | **auto-detecção dos motores**, imagens/volumes/redes/uso de disco de cada motor, builds do Buildah, sistema, VPS (provedor, NTP, DNS, OOM killer, vnStat), timers, cron, eventos do journal |
 | Segurança | `security_interval_seconds` (5 min) | auditoria (sshd, firewall, contas, sysctl…), fail2ban, logins SSH, sudo, SMART |
 | Atualizações | `updates_interval_seconds` (30 min) | pacotes pendentes (somente cache local, nunca acessa a rede) |
 | Endpoints | `endpoint_interval_seconds` (60 s) | sites/APIs, certificados e portas, **a partir do Windows** e em segundo plano (um site lento nunca atrasa a coleta SSH) |
@@ -247,8 +258,13 @@ na interface fica em `%APPDATA%\FirawynixMonitor\preferences.json` e tem priorid
 | `host_key_policy` | `"accept-new"` | `accept-new` (TOFU, como o OpenSSH) ou `strict`. Chave **diferente** da gravada é sempre recusada |
 | `unit_types` | todos | Tipos de unidade systemd coletados: `service`, `timer`, `socket`, `mount`, `path` |
 | `use_sudo` | `true` | `sudo -n` para iniciar/parar/reiniciar unidades (ignorado se `username` for `root`) |
-| `docker` / `docker_sudo` | `"auto"` / `false` | `auto` (detecta), `on` (avisa se indisponível) ou `off`; sudo para o Docker |
+| `docker` / `docker_sudo` | `"auto"` / `false` | `auto` (usa se a auto-detecção encontrar), `on` (sempre; avisa se indisponível) ou `off`; sudo para o Docker. A escolha feita em **Motores…** tem prioridade |
 | `podman` / `podman_sudo` | `"auto"` / `false` | Idem para o Podman (rootless funciona sem sudo) |
+| `nerdctl` / `nerdctl_sudo` / `nerdctl_namespace` | `"auto"` / `false` / `""` | containerd via `nerdctl` (ex.: `"k8s.io"` para ver os contêineres do k3s) |
+| `cri` / `cri_sudo` | `"auto"` / `false` | Contêineres do Kubernetes direto no runtime CRI (CRI-O/containerd) via `crictl` — somente leitura; costuma exigir root |
+| `buildah` / `buildah_sudo` | `"auto"` / `false` | Builds em andamento (contêineres de trabalho) e imagens do Buildah |
+| `skopeo` | `"auto"` | Verificação de atualizações de imagens direto no registro (sem baixar) |
+| `container_admin` | `false` | Permite **remover** contêineres parados, imagens, volumes e limpar imagens órfãs pela interface |
 | `lxd` / `lxd_sudo` | `"auto"` / `false` | Instâncias LXD/Incus (`incus` ou `lxc`, inclusive snap) |
 | `kubernetes` | `"auto"` | Pods via `kubectl` |
 | `kubectl_command` | `"kubectl"` | Ex.: `"k3s kubectl"`, `"microk8s kubectl"` ou caminho absoluto |
@@ -265,7 +281,7 @@ na interface fica em `%APPDATA%\FirawynixMonitor\preferences.json` e tem priorid
 | `process_actions` | `false` | Habilita encerrar processos (TERM/KILL) |
 | `process_sudo` | `false` | `sudo -n kill` (**não recomendado**: permite encerrar qualquer processo) |
 | `poll_interval_seconds` | global | Intervalo específico deste servidor |
-| `critical_services` | `["*"]` | Padrões *glob* dos itens que geram alerta. `nginx` casa com `nginx.service`; prefixos restringem o tipo: `systemd:`, `docker:`, `podman:`, `lxd:` (ou `incus:`), `k8s:` (ex.: `k8s:prod/*`), `vm:` |
+| `critical_services` | `["*"]` | Padrões *glob* dos itens que geram alerta. `nginx` casa com `nginx.service`; prefixos restringem o tipo: `systemd:`, `docker:`, `podman:`, `nerdctl:` (ou `containerd:`), `cri:`, `lxd:` (ou `incus:`), `k8s:` (ex.: `k8s:prod/*`), `vm:` |
 | `exclude_services` | `[]` | Padrões ocultados da tabela e dos alertas |
 
 ### Segredos
@@ -301,7 +317,13 @@ Senhas e passphrases **nunca** ficam no `servers.json` — chaves como `password
    sudo usermod -aG libvirt monitor           # VMs (se houver)
    sudo usermod -aG docker monitor            # ATENÇÃO: grupo docker ≈ acesso root
    sudo apt install vnstat smartmontools      # opcional: franquia mensal e SMART
+   sudo apt install skopeo                    # opcional: verificar atualizações de imagens
    ```
+
+   Em vez do grupo `docker`, prefira `docker_sudo: true` com as regras **restritas** de
+   [`docs/sudoers.example`](docs/sudoers.example) (leitura, ações, remoções e console em
+   blocos separados — `docker run`, por exemplo, continua negado). O Podman rootless não
+   precisa de nada.
 
 3. **Ações e leituras privilegiadas sem senha, apenas para os comandos necessários** — o
    monitor usa `sudo -n` (não interativo) e **nunca** envia senha ao sudo. Crie
@@ -336,6 +358,13 @@ Senhas e passphrases **nunca** ficam no `servers.json` — chaves como `password
   IP nem o loopback, e toda ação pede confirmação.
 * **VPS**: *Verificar agora* refaz os endpoints; a franquia aparece quando
   `bandwidth_quota_gb` está definido e o vnStat está instalado.
+* **Contêineres**: os blocos no topo (Contêineres, Imagens, Volumes, Redes, Builds,
+  Disco) trocam a visão; o filtro *Todos os motores* restringe a um motor. Em *Imagens*,
+  **Verificar atualizações (skopeo)** compara o digest local com o do registro — *nova
+  versão disponível* significa que a tag foi republicada (atualize com `pull` + recriar o
+  contêiner, ex.: `docker compose up -d`). **Console** abre um shell no contêiner no
+  Windows Terminal (`ssh -t … exec -it`). **Motores…** escolhe entre auto-detecção e
+  seleção manual (veja abaixo).
 * **Stacks**: selecione uma stack para ver os membros; as ações valem para todos os
   contêineres dela. Namespaces do Kubernetes são somente leitura aqui.
 * **Pods**: *Reiniciar* exclui o pod para o controlador recriá-lo. Iniciar/Parar não se aplicam.
@@ -348,6 +377,45 @@ Senhas e passphrases **nunca** ficam no `servers.json` — chaves como `password
   avisos, vermelho = item crítico com falha, site fora do ar, disco falhando ou servidor
   inacessível, cinza = conectando. O menu também tem *Iniciar com o Windows*.
 * **Logs da aplicação**: `%LOCALAPPDATA%\FirawynixMonitor\logs\monitor.log`.
+
+## Motores de contêiner: auto-detecção e o mesmo painel para todos
+
+O painel **não depende do motor**: Docker, Podman, containerd (nerdctl), CRI-O/containerd
+(crictl), Buildah e Skopeo chegam no mesmo modelo (contêineres, imagens, volumes, redes,
+builds e uso de disco) e aparecem com as mesmas colunas, filtros e botões. Trocar Docker
+por Podman amanhã não muda nada na interface.
+
+* **Auto-detectar (padrão)**: a cada ciclo de inventário o monitor procura os binários
+  (`command -v`, inclusive `/usr/local/bin` e `/snap/bin`), a versão de cada um, o modo
+  rootless do Podman, o Compose e os serviços (`docker`, `containerd`, `crio`,
+  `podman.socket`) — um único comando SSH. Só os motores encontrados são consultados; um
+  motor que some depois de funcionar gera aviso, um que nunca existiu fica em silêncio.
+* **Escolher manualmente** (**Motores…** na aba Contêineres): marque os motores que o
+  servidor usa. Os marcados são sempre consultados (com aviso se faltarem); os demais
+  são ignorados. Na auto-detecção, desmarcar um motor faz o monitor ignorá-lo mesmo que
+  esteja instalado. A escolha vale na hora, sem reiniciar, e fica em `preferences.json`
+  (`engines.<servidor>`), com prioridade sobre o `servers.json`.
+* **Painéis de terceiros não mudam o layout**: se o servidor roda Portainer, Cockpit,
+  Dockge, Yacht, Dozzle ou Rancher (em contêiner ou como serviço), eles aparecem em
+  *Painéis web detectados* com um botão que abre o endereço no navegador. O Watchtower é
+  sinalizado porque atualiza contêineres sozinho.
+* **O que cada motor oferece**:
+
+| Motor | Contêineres | Ações | Imagens / volumes / redes | Observação |
+|---|---|---|---|---|
+| Docker | ✔ (Compose, portas, stats) | iniciar, parar, reiniciar, pausar, console, remover | ✔ + `system df` | `docker_sudo` com regras restritas ou grupo `docker` |
+| Podman | ✔ (pods, Compose, rootless) | idem | ✔ + `system df` | rootless sem sudo |
+| containerd (nerdctl) | ✔ (namespace configurável) | idem | ✔ | `nerdctl_namespace: "k8s.io"` mostra o que o k3s roda |
+| CRI-O / containerd (crictl) | ✔ (pod e namespace) | somente leitura: logs e inspecionar | imagens | o kubelet recria o que for parado à mão |
+| Buildah | builds em andamento | — | imagens (sem duplicar as do Podman) | |
+| Skopeo | — | verificar atualizações | — | consulta o registro sem baixar a imagem |
+| LXD/Incus | na aba Serviços | iniciar, parar, reiniciar | — | contêineres de sistema e VMs |
+
+**Atualizações de imagem**: o Skopeo calcula o digest do manifesto remoto (`skopeo
+inspect --raw` + `sha256sum`), o mesmo que o Docker/Podman grava em `RepoDigests` ao
+baixar pela tag. Igual = *em dia*; diferente = *nova versão disponível*. Registros
+privados usam as credenciais já salvas no servidor (`skopeo login`, `podman login` ou
+`docker login`); cada consulta é limitada a 4 s.
 
 ## Integração com a API do Windows
 
@@ -400,7 +468,9 @@ Windows** (grava a chave `Run` do seu usuário; não precisa de administrador).
   validados na configuração, e todo valor passa por `shlex.quote`; os comandos rodam via
   `sh -c` com `LC_ALL=C`.
 * **Ações destrutivas desligadas por padrão**: encerrar processos exige
-  `process_actions: true` e banir IPs exige `security_actions: true`; toda ação pede
+  `process_actions: true`, banir IPs exige `security_actions: true` e remover
+  contêineres/imagens/volumes exige `container_admin: true` (contêineres em execução e
+  volumes em uso nunca são removidos; a limpeza apaga só imagens órfãs); toda ação pede
   confirmação e fica registrada no log e no Visualizador de Eventos.
 * **Nunca se tranca para fora**: o IP do próprio monitor (visto pelo servidor em
   `$SSH_CLIENT`) não pode ser banido; a latência não abre conexões extras no sshd.
@@ -414,7 +484,8 @@ pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-Cobrem os parsers (formatos modernos e legados de `systemctl`, `docker`/`podman`,
+Cobrem os parsers (formatos modernos e legados de `systemctl`, `docker`/`podman`/`nerdctl`,
+`crictl`, `buildah`, `skopeo` e a auto-detecção de motores,
 `incus`/`lxc`, `kubectl`, `virsh`, `/proc/*`, `ss` e o fallback `/proc/net`, `free`,
 `df`, cron, journal, `sshd_config` com `Include`/`Match`, `authorized_keys`, fail2ban,
 `smartctl -j` ATA/NVMe, vnStat 1.x/2.x, `timedatectl` antigo e novo, DMI), a auditoria de
@@ -433,6 +504,11 @@ reconexão, perda de conexão, timeouts, endpoints em segundo plano) com um clie
 | "Interactive authentication required" | `use_sudo` desligado e o polkit negou. Ligue `use_sudo` e configure o sudoers |
 | Logs/eventos incompletos, "Journal parcial", tentativas SSH "Indeterminado" | Adicione o usuário ao grupo `systemd-journal` (ou use `logs_sudo`) |
 | "Sem permissão no socket do Docker/Podman" | Grupo `docker`, Podman rootless, ou `docker_sudo`/`podman_sudo` |
+| Motor instalado mas não aparece | Clique em **Detectar agora** (a detecção roda no ciclo de inventário) e confira em **Motores…** se ele não está desmarcado. Binários fora do `PATH` padrão: `/usr/local/bin`, `/usr/sbin`, `/snap/bin` também são procurados |
+| containerd/CRI "sem permissão" | O socket do containerd/CRI-O é do root: `nerdctl_sudo`/`cri_sudo` + regras do sudoers |
+| Imagem "não verificada: registro exige login" | Faça `skopeo login` (ou `docker login`) no servidor com o usuário do monitor |
+| Imagem "não verificável" | Imagem construída localmente ou órfã: não tem digest de registro para comparar |
+| Pausar falha no Podman rootless | Podman rootless só pausa com cgroup v2 |
 | "Sem permissão no LXD/Incus" | Grupo `incus-admin` (ou `lxd`) ou `lxd_sudo` |
 | "kubectl sem kubeconfig" / sem permissão | No k3s use `"kubectl_command": "k3s kubectl"` com `kubectl_sudo: true` |
 | "Sem permissão no libvirt" | `sudo usermod -aG libvirt monitor` ou `libvirt_sudo` |
@@ -453,7 +529,7 @@ reconexão, perda de conexão, timeouts, endpoints em segundo plano) com um clie
 ## Atualizando dependências
 
 As versões em `requirements*.txt` são exatas (incluindo as transitivas) para builds
-reprodutíveis. A v3 não adicionou dependências: as integrações com o Windows usam só a
+reprodutíveis. A v3 (e a 3.1) não adicionaram dependências: as integrações com o Windows usam só a
 biblioteca padrão (`ctypes`, `winreg`) e os certificados são lidos com o `cryptography`
 que o Paramiko já instala. Para atualizar:
 

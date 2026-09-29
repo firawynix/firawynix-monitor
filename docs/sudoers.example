@@ -4,8 +4,8 @@
 #   sudo visudo -f /etc/sudoers.d/firawynix-monitor
 #
 # Confirme os caminhos absolutos no servidor e ajuste abaixo:
-#   command -v systemctl docker podman kubectl k3s virsh ss kill incus lxc \
-#              sshd ufw iptables nft fail2ban-client smartctl
+#   command -v systemctl docker podman nerdctl crictl buildah kubectl k3s virsh ss \
+#              kill incus lxc sshd ufw iptables nft fail2ban-client smartctl
 #
 # O Firawynix Monitor executa EXATAMENTE estes comandos, sempre com "sudo -n"
 # (não interativo: se o sudoers exigir senha, a ação falha na hora e a
@@ -15,9 +15,18 @@
 #   use_sudo      systemctl --no-block start|stop|restart <unidade>
 #   logs_sudo     journalctl -u <unidade> -n <N> --no-pager
 #   docker_sudo   docker ps -a --format ... | docker stats --no-stream --format ...
+#                 docker images|volume ls|network ls|network inspect|system df ... (inventário)
 #                 docker start|stop -t 3|restart -t 3 <contêiner> [<contêiner>...]
+#                 docker pause|unpause <contêiner> | docker inspect <contêiner>
 #                 docker logs --tail <N> --timestamps <contêiner>
-#   podman_sudo   os mesmos comandos acima com "podman" (ps usa "--format json")
+#                 docker exec -it <contêiner> sh -c ...          (botão Console)
+#     + container_admin: docker rm|rmi <alvo> | docker image prune -f | docker volume rm <volume>
+#   podman_sudo   os mesmos comandos com "podman" (listagens usam "--format json")
+#   nerdctl_sudo  os mesmos com "nerdctl [--namespace <ns>]"
+#   cri_sudo      crictl ps -a -o json | crictl images -o json | crictl inspect|inspecti <id>
+#                 crictl logs --tail <N> --timestamps <id>        (somente leitura)
+#   buildah_sudo  buildah containers --json | buildah images --json
+#   skopeo        sem sudo: timeout 4 skopeo inspect --raw --authfile <arquivo> docker://<imagem>
 #   kubectl_sudo  kubectl get pods -A ... | kubectl delete pod -n <ns> <pod> ...
 #                 kubectl logs -n <ns> <pod> ...   (ou "k3s kubectl ...")
 #   libvirt_sudo  virsh -c <uri> -q list --all | start|shutdown|reboot|dominfo <vm>
@@ -116,6 +125,63 @@ monitor ALL=(root) NOPASSWD: FWX_NGINX, FWX_APP
 # Cmnd_Alias FWX_LXD = /usr/bin/incus list --format json, /usr/bin/incus info --show-log *, \
 #                      /usr/bin/incus start *, /usr/bin/incus stop *, /usr/bin/incus restart *
 # monitor ALL=(root) NOPASSWD: FWX_LXD
+
+# ---------------------------------------------------------------------------
+# Docker (docker_sudo: true) — alternativa ao grupo "docker" (que equivale a root).
+# Blocos separados: libere só o que usar. Testado com Docker 29: o que estiver fora
+# das regras (ex.: "docker run", "docker exec --privileged") continua NEGADO.
+# Os caracteres "=" e "\" precisam de escape no sudoers ("dangling\=true").
+# ---------------------------------------------------------------------------
+# Leitura (contêineres, stats, inventário, logs e inspecionar):
+# Cmnd_Alias FWX_DOCKER_READ = /usr/bin/docker ps -a --format {{json .}}, \
+#     /usr/bin/docker stats --no-stream --format {{.Name}}|{{.CPUPerc}}|{{.MemUsage}}, \
+#     /usr/bin/docker images --digests --format {{json .}}, \
+#     /usr/bin/docker volume ls --format {{json .}}, \
+#     /usr/bin/docker volume ls -q --filter dangling\=true, \
+#     /usr/bin/docker network ls --format {{json .}}, /usr/bin/docker network ls -q, \
+#     /usr/bin/docker network inspect --format {{.Name}}|{{range .IPAM.Config}}{{.Subnet}} {{end}}|{{len .Containers}} *, \
+#     /usr/bin/docker system df --format {{json .}}, \
+#     /usr/bin/docker logs --tail * --timestamps *, \
+#     /usr/bin/docker inspect *, /usr/bin/docker image inspect *, /usr/bin/docker volume inspect *
+# Iniciar/parar/reiniciar/pausar/retomar:
+# Cmnd_Alias FWX_DOCKER_CTL = /usr/bin/docker start *, /usr/bin/docker stop -t 3 *, \
+#     /usr/bin/docker restart -t 3 *, /usr/bin/docker pause *, /usr/bin/docker unpause *
+# Remoções (só com "container_admin": true):
+# Cmnd_Alias FWX_DOCKER_ADMIN = /usr/bin/docker rm *, /usr/bin/docker rmi *, \
+#     /usr/bin/docker image prune -f, /usr/bin/docker volume rm *
+# Console (shell DENTRO do contêiner; opcional):
+# Cmnd_Alias FWX_DOCKER_SHELL = /usr/bin/docker exec -it * sh -c command -v bash >/dev/null 2>&1 && exec bash || exec sh
+# monitor ALL=(root) NOPASSWD: FWX_DOCKER_READ, FWX_DOCKER_CTL
+#
+# Podman: rootless (contêineres do próprio usuário "monitor") dispensa sudo. Para
+# contêineres do root, repita as regras acima com /usr/bin/podman e "--format json"
+# no lugar de "--format {{json .}}" (ps, images, volume ls, network ls, system df).
+
+# ---------------------------------------------------------------------------
+# containerd via nerdctl (nerdctl_sudo: true) — o socket do containerd é do root.
+# Com "nerdctl_namespace": "k8s.io" todos os comandos levam "--namespace k8s.io":
+# ---------------------------------------------------------------------------
+# Cmnd_Alias FWX_NERDCTL = /usr/local/bin/nerdctl --namespace k8s.io ps -a --format {{json .}}, \
+#     /usr/local/bin/nerdctl --namespace k8s.io stats --no-stream --format *, \
+#     /usr/local/bin/nerdctl --namespace k8s.io images --digests --format {{json .}}, \
+#     /usr/local/bin/nerdctl --namespace k8s.io volume ls *, \
+#     /usr/local/bin/nerdctl --namespace k8s.io network ls --format {{json .}}, \
+#     /usr/local/bin/nerdctl --namespace k8s.io logs --tail * --timestamps *, \
+#     /usr/local/bin/nerdctl --namespace k8s.io inspect *
+# monitor ALL=(root) NOPASSWD: FWX_NERDCTL
+
+# ---------------------------------------------------------------------------
+# CRI-O / containerd via crictl (cri_sudo: true) — somente leitura.
+# ---------------------------------------------------------------------------
+# Cmnd_Alias FWX_CRI = /usr/local/bin/crictl ps -a -o json, /usr/local/bin/crictl images -o json, \
+#     /usr/local/bin/crictl logs --tail * --timestamps *, \
+#     /usr/local/bin/crictl inspect *, /usr/local/bin/crictl inspecti *
+# monitor ALL=(root) NOPASSWD: FWX_CRI
+
+# ---------------------------------------------------------------------------
+# Buildah (buildah_sudo: true, só para builds do root) — somente leitura.
+# ---------------------------------------------------------------------------
+# monitor ALL=(root) NOPASSWD: /usr/bin/buildah containers --json, /usr/bin/buildah images --json
 
 # ---------------------------------------------------------------------------
 # NÃO recomendado: "kill" via sudo equivale a poder encerrar qualquer processo

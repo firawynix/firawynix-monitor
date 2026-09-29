@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import tkinter as tk
+import webbrowser
 from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import Future
@@ -23,14 +24,16 @@ from pathlib import Path
 
 import customtkinter as ctk
 
-from config.preferences import Preferences
+from config.preferences import Preferences, engine_preference_key
 from config.settings import Config, ServerConfig
+from core import containers as engines
 from core import winapi
 from core.history import HistoryStore
 from core.models import (
     ActionOutcome,
     ActionResultEvent,
     AlertKind,
+    ContainerImage,
     CheckLevel,
     ConnectionEvent,
     ConnectionState,
@@ -50,6 +53,8 @@ from core.models import (
 from core.monitor import MonitorManager
 from core.notifier import Notifier
 from ui import theme
+from ui.containers_tab import ContainersTab, selection_summary
+from ui.engines_dialog import EnginesDialog
 from ui.options import WindowsOptionsDialog
 from ui.security_tab import SecurityTab
 from ui.tabs import (
@@ -91,8 +96,8 @@ log = logging.getLogger(__name__)
 
 APP_TITLE = "Firawynix Monitor"
 OVERVIEW = "Visão geral"
-TABS = (ServicesTab, StacksTab, ProcessesTab, NetworkTab, VpsTab, SecurityTab, SchedulesTab, EventsTab, SystemTab,
-        HistoryTab)
+TABS = (ServicesTab, ContainersTab, StacksTab, ProcessesTab, NetworkTab, VpsTab, SecurityTab, SchedulesTab,
+        EventsTab, SystemTab, HistoryTab)
 INTERVAL_OPTIONS = (2, 5, 10, 30, 60)
 CONNECTION_COLORS = {
     ConnectionState.CONNECTING: YELLOW,
@@ -252,7 +257,11 @@ class Dashboard(ctk.CTk):
     # -- API usada pelas abas -------------------------------------------------
 
     def server_config(self, name: str) -> ServerConfig:
-        return self._config.server(name)
+        """Configuração em vigor (inclui a escolha de motores feita no painel)."""
+        return self.manager.server_config(name)
+
+    def snapshot(self, server: str) -> HostSnapshot | None:
+        return self._snapshots.get(server)
 
     @property
     def current_server(self) -> str | None:
@@ -338,6 +347,107 @@ class Dashboard(ctk.CTk):
             return
         self._mark_busy(server, f"ip:{ip}", "Banindo" if ban else "Desbanindo", ip)
         self.manager.fail2ban_action(server, jail, ip, ban)
+
+    def container_op(self, server: str, service: ServiceInfo, op: str) -> None:
+        """Pausar / retomar / remover — o mesmo diálogo para Docker, Podman e containerd."""
+        if not self._ensure_connected(server):
+            return
+        engine = service.kind.label
+        if op == "pause":
+            title, verb, danger = f"Pausar {service.name}", "Pausar", False
+            message = (f"Pausar o contêiner \"{service.name}\" ({engine}) em {server}?\n\nOs processos ficam "
+                       "congelados (cgroup freezer) até \"Retomar\"; a memória continua ocupada.")
+        elif op == "unpause":
+            title, verb, danger = f"Retomar {service.name}", "Retomar", False
+            message = f"Retomar o contêiner pausado \"{service.name}\" ({engine}) em {server}?"
+        elif op == "rm":
+            title, verb, danger = f"Remover {service.name}", "Remover", True
+            message = (f"Remover definitivamente o contêiner parado \"{service.name}\" ({engine}) em {server}?\n\n"
+                       "Volumes nomeados são mantidos. Para voltar, será preciso recriá-lo (ex.: compose up -d).")
+        else:
+            return
+        if service.critical and tuple(self.server_config(server).critical_services) != ("*",):
+            message += "\n\nAtenção: este item está marcado como CRÍTICO."
+        if not self.confirm(title, message, verb, danger):
+            return
+        label = {"pause": "Pausando", "unpause": "Retomando", "rm": "Removendo"}[op]
+        self._mark_busy(server, service.key, label, service.name)
+        self.manager.container_op(server, service, op)
+
+    def image_op(self, server: str, engine_id: str, image: ContainerImage | None, op: str) -> None:
+        if not self._ensure_connected(server):
+            return
+        engine = engines.ENGINES[engine_id].label
+        if op == "prune":
+            title, verb = f"Limpar imagens órfãs — {engine}", "Limpar"
+            message = (f"Remover todas as imagens órfãs (sem tag) do {engine} em {server}?\n\n"
+                       "Imagens com tag e imagens em uso não são afetadas.")
+            busy, target = f"prune:{engine_id}", f"imagens órfãs ({engine})"
+        elif op == "rmi" and image is not None:
+            title, verb = f"Remover imagem {image.reference}", "Remover"
+            message = (f"Remover a imagem \"{image.reference}\" ({engine}) de {server}?\n\n"
+                       "Se algum contêiner (mesmo parado) usar esta imagem, o motor recusa a remoção. "
+                       "Ela pode ser baixada de novo com pull.")
+            busy, target = f"image:{image.key}", image.reference
+        else:
+            return
+        if not self.confirm(title, message, verb, danger=True):
+            return
+        self._mark_busy(server, busy, "Removendo", target)
+        self.manager.image_op(server, engine_id, image, op)
+
+    def volume_op(self, server: str, engine_id: str, name: str, op: str) -> None:
+        if op != "rm" or not self._ensure_connected(server):
+            return
+        engine = engines.ENGINES[engine_id].label
+        message = (f"Remover o volume \"{name}\" ({engine}) de {server}?\n\n"
+                   "OS DADOS DO VOLUME SERÃO APAGADOS e não podem ser recuperados pelo painel.")
+        if not self.confirm(f"Remover volume {name}", message, "Remover volume", danger=True):
+            return
+        self._mark_busy(server, f"volume:{engine_id}:{name}", "Removendo", f"volume {name}")
+        self.manager.volume_op(server, engine_id, name, op)
+
+    def inspect_item(self, server: str, what: str, engine_id: str, target, name: str) -> None:
+        """JSON do ``inspect`` (contêiner, imagem ou volume) de qualquer motor."""
+        if not self._ensure_connected(server):
+            return
+        engine = engines.ENGINES[engine_id].label if engine_id in engines.ENGINES else engine_id
+        noun = {"container": "contêiner", "image": "imagem", "volume": "volume"}[what]
+        TextViewer(self, title=f"Inspecionar {noun} — {name}", subtitle=f"{noun} {name}  ·  {engine}  ·  {server}",
+                   fetch=lambda _lines: self.manager.inspect(server, what, engine_id, target), line_selector=False)
+
+    def open_console(self, server: str, service: ServiceInfo) -> None:
+        """Shell interativo no contêiner: ``ssh -t ... <motor> exec -it``."""
+        if not self._ensure_connected(server):
+            return
+        try:
+            remote = self.manager.console_command(server, service)
+        except ValueError as exc:
+            self.set_status(str(exc), error=True)
+            return
+        self._launch_ssh(server, remote, f"{service.name} @ {server}")
+
+    def open_url(self, url: str) -> None:
+        if not url.startswith(("http://", "https://")):
+            return
+        try:
+            webbrowser.open(url, new=2)
+        except webbrowser.Error as exc:
+            self.copy_text(url)
+            self.set_status(f"Não foi possível abrir o navegador ({exc}). Endereço copiado.", warning=True)
+            return
+        self.set_status(f"Abrindo {url} no navegador…")
+
+    def open_engines_dialog(self, server: str | None = None) -> None:
+        EnginesDialog(self, server or self._current)
+
+    def apply_engine_selection(self, server: str, selection: dict) -> None:
+        """Salva a escolha de motores (preferences.json) e aplica sem reiniciar."""
+        self.preferences.set(engine_preference_key(server), selection)
+        self.manager.set_engine_modes(server, engines.selection_to_modes(selection))
+        self.log_windows_event(f"[{server}] Motores de contêiner: {selection_summary(selection)}.", "info", "app")
+        self.set_status(f"[{server}] Motores de contêiner: {selection_summary(selection)}. Detectando…")
+        self.render_current_tab()
 
     def open_logs(self, server: str, service: ServiceInfo) -> None:
         title = "Detalhes" if service.kind is ServiceKind.LIBVIRT else "Logs"
@@ -466,19 +576,25 @@ class Dashboard(ctk.CTk):
 
     def open_terminal(self) -> None:
         """Abre um terminal com ``ssh`` para o servidor atual (cliente OpenSSH do Windows)."""
-        if self._current is None:
-            return
-        server = self.server_config(self._current)
+        if self._current is not None:
+            self._launch_ssh(self._current)
+
+    def _launch_ssh(self, name: str, remote_command: str | None = None, title: str | None = None) -> None:
+        server = self.server_config(name)
         args = ["ssh", "-p", str(server.port)]
         if server.key_file:
             args += ["-i", str(server.key_file)]
+        if remote_command:
+            args.append("-t")  # console interativo dentro do contêiner
         args.append(f"{server.username}@{server.host}")
+        if remote_command:
+            args.append(remote_command)
         command_line = subprocess.list2cmdline(args)
         try:
             if sys.platform == "win32":
                 wt = shutil.which("wt")
                 if wt:
-                    subprocess.Popen([wt, "new-tab", "--title", f"SSH {server.name}", *args])
+                    subprocess.Popen([wt, "new-tab", "--title", title or f"SSH {server.name}", *args])
                 else:
                     subprocess.Popen(args, creationflags=subprocess.CREATE_NEW_CONSOLE)
             else:
@@ -579,7 +695,8 @@ class Dashboard(ctk.CTk):
         else:
             counts = snapshot.counts()
             parts = [f"{counts[ServiceStatus.STOPPED]} paradas", f"{len(snapshot.services)} total"]
-            containers = snapshot.count_kind(ServiceKind.DOCKER) + snapshot.count_kind(ServiceKind.PODMAN)
+            # Contêineres CRI são os dos pods (já contados como pods).
+            containers = sum(1 for s in snapshot.services if s.kind.is_container and s.kind is not ServiceKind.CRI)
             for count, label in ((containers, "contêineres"), (snapshot.count_kind(ServiceKind.KUBERNETES), "pods"),
                                  (snapshot.count_kind(ServiceKind.LIBVIRT), "VMs"),
                                  (snapshot.count_kind(ServiceKind.LXD), "LXD")):

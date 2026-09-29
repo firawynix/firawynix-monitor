@@ -7,6 +7,7 @@ todos os tipos de carga: systemd, Docker Compose, Podman, Kubernetes e VMs.
 
 from __future__ import annotations
 
+import json
 import math
 import random
 import threading
@@ -14,12 +15,20 @@ import time
 
 from config.settings import AppSettings, Config, NotificationSettings, ServerConfig
 from core import commands as cmd
+from core import containers as engines
 from core.history import HistoryStore
 from core.models import (
     ActionOutcome,
     ActionResult,
     AuthorizedKey,
     BandwidthUsage,
+    BuildContainer,
+    ContainerImage,
+    ContainerNetwork,
+    ContainerVolume,
+    DetectedTool,
+    EngineDiskUsage,
+    ImageUpdate,
     CronEntry,
     DiskIO,
     DiskUsage,
@@ -122,7 +131,31 @@ _DOCKER = {
         ("monitoring-prometheus-1", "prom/prometheus:v2.54.1", "monitoring", "prometheus"),
         ("monitoring-loki-1", "grafana/loki:3.1.1", "monitoring", "loki"),
         ("backup-job", "restic/restic:0.17.1", "", ""),
+        ("portainer", "portainer/portainer-ce:2.21.3", "", ""),
+        ("watchtower", "containrrr/watchtower:1.7.1", "", ""),
     ],
+}
+_DEMO_PORTS = {
+    "portainer": "0.0.0.0:9443->9443/tcp, [::]:9443->9443/tcp, 8000/tcp",
+    "edge-traefik-1": "0.0.0.0:80->80/tcp, 0.0.0.0:443->443/tcp",
+    "monitoring-grafana-1": "127.0.0.1:3000->3000/tcp",
+    "shop-redis-1": "6379/tcp",
+    "pgbouncer": "0.0.0.0:6432->6432/tcp",
+    "site-web": "0.0.0.0:8080->80/tcp",
+}
+#: containerd (nerdctl) e CRI no nó k3s-edge.
+_NERDCTL = [("site-web", "docker.io/library/nginx:1.27-alpine", "site", "running", "Up 5 days"),
+            ("site-cache", "docker.io/library/redis:7.4", "site", "running", "Up 5 days"),
+            ("registry-mirror", "docker.io/library/registry:2", "", "exited", "Exited (0) 3 days ago")]
+_CRI = [("coredns", "registry.k8s.io/coredns/coredns:v1.11.3", "kube-system/coredns-7b98449c4-x2k9d", "running", 0),
+        ("storefront", "ghcr.io/acme/storefront:4.2.0", "prod/storefront-6c8d9f7b5-2hxkq", "running", 0),
+        ("payments", "ghcr.io/acme/payments:1.9.3", "prod/payments-7d4f5b9c8-kq2mz", "exited", 14),
+        ("traefik", "rancher/mirrored-library-traefik:2.11.8", "kube-system/traefik-d7c9c5778-pl5wx", "running", 0)]
+_ENGINES = {
+    "prod-web-01": {"docker": "27.3.1", "skopeo": "1.16.1"},
+    "prod-db-01": {"podman": "5.2.2", "buildah": "1.37.3", "skopeo": "1.16.1"},
+    "k3s-edge": {"nerdctl": "2.0.0", "crictl": "1.31.0", "kubectl": "1.30.4", "k3s": "1.30.4+k3s1"},
+    "hv-01": {"incus": "6.5"},
 }
 _PODMAN = {
     "prod-db-01": [
@@ -196,7 +229,7 @@ def demo_config() -> Config:
                            notifications=NotificationSettings(cooldown_seconds=30))
     servers = (
         ServerConfig(name="prod-web-01", host="10.0.10.21", username="monitor", security_sudo=True,
-                     security_actions=True, bandwidth_quota_gb=1000,
+                     security_actions=True, bandwidth_quota_gb=1000, container_admin=True,
                      endpoints=tuple(e[0] for e in _ENDPOINTS["prod-web-01"]),
                      critical_services=("nginx", "gunicorn", "celery*", "docker:shop-*", "docker:edge-*")),
         ServerConfig(name="prod-db-01", host="10.0.10.31", username="monitor", password_env="DEMO_DB_PASSWORD",
@@ -258,6 +291,9 @@ class DemoClient:
             self._pods["prod/payments-7d4f5b9c8-kq2mz"] = ["Running", ["false"], 14, "CrashLoopBackOff", "ReplicaSet"]
             self._pods["prod/nightly-report-28791440-6hk2p"] = ["Succeeded", ["false"], 0, "", "Job"]
         self._vms = dict(_VMS) if server.name == "hv-01" else {}
+        self._nerdctl = {n: [state, status, image, group] for n, image, group, state, status in _NERDCTL} \
+            if server.name == "k3s-edge" else {}
+        self._removed: set[str] = set()
         self._lxd = {name: [status, kind, image, ip] for name, status, kind, image, ip in _LXD} \
             if server.name == "hv-01" else {}
         self._banned = {"sshd": ["203.0.113.9", "198.51.100.7"]} if server.name == "prod-web-01" else \
@@ -296,29 +332,178 @@ class DemoClient:
                 if name.endswith(".service") and active == "active"}
 
     def list_containers(self, runtime: ServiceKind) -> RuntimeResult:
+        if runtime in (ServiceKind.NERDCTL, ServiceKind.CRI):
+            return self._list_k3s_containers(runtime)
         with self._lock:
             if runtime is ServiceKind.DOCKER:
                 if not self._docker:
                     return RuntimeResult(runtime, RuntimeState.NOT_INSTALLED, (), "Docker não instalado neste host.")
                 items = tuple(
                     ServiceInfo(ServiceKind.DOCKER, name, image, classify_container(state, status), state, status,
-                                group=group, meta=(("working_dir", f"/opt/{group}"),
-                                                   ("config_files", f"/opt/{group}/compose.yaml"),
-                                                   ("compose_service", service)) if group else ())
+                                group=group, meta=((("working_dir", f"/opt/{group}"),
+                                                    ("config_files", f"/opt/{group}/compose.yaml"),
+                                                    ("compose_service", service)) if group else ())
+                                + ((("ports", _DEMO_PORTS[name]),) if name in _DEMO_PORTS else ()))
                     for name, (state, status, image, group, service) in self._docker.items())
             else:
                 if not self._podman:
                     return RuntimeResult(runtime, RuntimeState.NOT_INSTALLED, (), "Podman não instalado neste host.")
                 items = tuple(
                     ServiceInfo(ServiceKind.PODMAN, name, image, classify_container(state, status), state, status,
-                                group=pod, meta=(("pod", pod),) if pod else ())
+                                group=pod, meta=((("pod", pod),) if pod else ())
+                                + ((("ports", _DEMO_PORTS[name]),) if name in _DEMO_PORTS else ()))
                     for name, (state, status, image, pod) in self._podman.items())
             return RuntimeResult(runtime, RuntimeState.OK, items)
 
     def container_stats(self, runtime: ServiceKind) -> dict[str, tuple[float | None, int | None]]:
-        names = self._docker if runtime is ServiceKind.DOCKER else self._podman
+        names = {ServiceKind.DOCKER: self._docker, ServiceKind.PODMAN: self._podman,
+                 ServiceKind.NERDCTL: self._nerdctl}.get(runtime, {})
         rng = random.Random(self._polls * 7)
         return {name: (rng.uniform(0.2, 35), rng.randint(40, 1400) * MIB) for name in names}
+
+    def _list_k3s_containers(self, runtime: ServiceKind) -> RuntimeResult:
+        if self.name != "k3s-edge":
+            return RuntimeResult(runtime, RuntimeState.NOT_INSTALLED, (), f"{runtime.label} não instalado.")
+        if runtime is ServiceKind.NERDCTL:
+            with self._lock:
+                items = tuple(ServiceInfo(runtime, name, image, classify_container(state, status), state, status,
+                                          group=group, meta=(("ports", _DEMO_PORTS[name]),) if name in _DEMO_PORTS
+                                          else ())
+                              for name, (state, status, image, group) in self._nerdctl.items())
+            return RuntimeResult(runtime, RuntimeState.OK, items)
+        items = []
+        for index, (name, image, pod, state, attempts) in enumerate(_CRI):
+            container_id = f"{index + 1:x}" * 64
+            status = ServiceStatus.ACTIVE if state == "running" else ServiceStatus.STOPPED
+            items.append(ServiceInfo(runtime, f"{name}-{container_id[:8]}", image, status, state,
+                                     state.capitalize() + (f" · {attempts} reinício(s)" if attempts else "")
+                                     + f" · pod {pod}",
+                                     meta=(("id", container_id), ("pod", pod), ("container", name))))
+        return RuntimeResult(runtime, RuntimeState.OK, tuple(items))
+
+    # -- motores de contêiner -------------------------------------------------
+
+    def discover_engines(self) -> engines.Discovery:
+        tools = {name: DetectedTool(name, f"/usr/bin/{name}", version)
+                 for name, version in _ENGINES.get(self.name, {}).items()}
+        return engines.Discovery(
+            tools=tools, compose={"docker": "2.29.7"} if "docker" in tools else {},
+            rootless={"podman": True} if "podman" in tools else {},
+            services={"cockpit.socket": "active" if self.name == "prod-db-01" else "inactive"})
+
+    def engine_inventory(self, engine_id: str) -> engines.EngineData:
+        mb = 1000 ** 2
+        refs = {"docker": [(image, "") for _n, image, _g, _s in _DOCKER.get(self.name, [])],
+                "podman": [(image, "") for _n, image, _p in _PODMAN.get(self.name, [])],
+                "nerdctl": [(image, "") for _n, image, _g, _s, _st in _NERDCTL],
+                "cri": [(image, "") for _n, image, _p, _s, _a in _CRI]}.get(engine_id, [])
+        rng = random.Random(self.name + engine_id)
+        images = []
+        for ref, _ in dict.fromkeys(refs):
+            repo, _, tag = ref.rpartition(":")
+            image_id = f"{rng.getrandbits(48):012x}"
+            if f"image:{engine_id}:{ref}" in self._removed:
+                continue
+            images.append(ContainerImage(engine_id, image_id, repo, tag, rng.randint(20, 900) * mb,
+                                         f"há {rng.randint(1, 60)} dias",
+                                         digests=(f"{repo}@sha256:{rng.getrandbits(256):064x}",)))
+        if engine_id in ("docker", "podman"):
+            for extra in ("node:20-bookworm", "python:3.12-slim"):
+                repo, _, tag = extra.partition(":")
+                images.append(ContainerImage(engine_id, f"{rng.getrandbits(48):012x}", repo, tag,
+                                             rng.randint(100, 1100) * mb, "há 4 meses", in_use=False,
+                                             digests=(f"{repo}@sha256:{rng.getrandbits(256):064x}",)))
+            if f"prune:{engine_id}" not in self._removed:
+                images.append(ContainerImage(engine_id, f"{rng.getrandbits(48):012x}", "<none>", "<none>",
+                                             380 * mb, "há 2 meses", in_use=False))
+        volumes, networks, disk = [], [], []
+        if engine_id == "docker":
+            volumes = [ContainerVolume(engine_id, name, "local", f"/var/lib/docker/volumes/{name}/_data", stack, used)
+                       for name, stack, used in (("shop_redis-data", "shop", True), ("monitoring_grafana", "monitoring",
+                                                                                           True),
+                                                 ("monitoring_prometheus", "monitoring", True),
+                                                 ("portainer_data", "", True), ("old_uploads", "", False))
+                       if f"volume:{engine_id}:{name}" not in self._removed]
+            networks = [ContainerNetwork(engine_id, "bridge", "bridge", "local", ("172.17.0.0/16",), 2),
+                        ContainerNetwork(engine_id, "shop_default", "bridge", "local", ("172.20.0.0/16",), 4),
+                        ContainerNetwork(engine_id, "monitoring_default", "bridge", "local", ("172.21.0.0/16",), 3),
+                        ContainerNetwork(engine_id, "edge", "bridge", "local", ("172.22.0.0/16",), 1),
+                        ContainerNetwork(engine_id, "host", "host", "local", (), 0),
+                        ContainerNetwork(engine_id, "none", "null", "local", (), 0)]
+            disk = [EngineDiskUsage(engine_id, "Images", len(images), len(images) - 3, "6.4GB", "1.7GB (26%)"),
+                    EngineDiskUsage(engine_id, "Local Volumes", len(volumes), len(volumes) - 1, "3.1GB",
+                                    "812MB (25%)"),
+                    EngineDiskUsage(engine_id, "Build Cache", 41, 0, "2.3GB", "2.3GB")]
+        elif engine_id == "podman":
+            volumes = [ContainerVolume(engine_id, "pgbouncer-conf", "local", "~/.local/share/containers/storage/"
+                                       "volumes/pgbouncer-conf/_data", "", True),
+                       ContainerVolume(engine_id, "pgadmin-data", "local", "", "", False)]
+            networks = [ContainerNetwork(engine_id, "podman", "bridge", "", ("10.88.0.0/16",)),
+                        ContainerNetwork(engine_id, "db-net", "bridge", "", ("10.89.0.0/24",))]
+            disk = [EngineDiskUsage(engine_id, "Images", len(images), 2, "1.9GB", "1.1GB (57%)"),
+                    EngineDiskUsage(engine_id, "Local Volumes", 2, 1, "240MB", "90MB (37%)")]
+        elif engine_id == "nerdctl":
+            volumes = [ContainerVolume(engine_id, "site-cache-data", "local", "", "site", True)]
+            networks = [ContainerNetwork(engine_id, "bridge", "bridge", "", ("10.4.0.0/24",)),
+                        ContainerNetwork(engine_id, "site_default", "bridge", "", ("10.4.1.0/24",))]
+        return engines.EngineData(tuple(images), tuple(volumes), tuple(networks), tuple(disk))
+
+    def buildah_inventory(self) -> tuple:
+        if self.name != "prod-db-01":
+            return (), ()
+        return (BuildContainer("5c1d9e0a7b2f", "pg-tools-working-container", "docker.io/library/alpine:3.20"),), ()
+
+    def container_op(self, service: ServiceInfo, op: str) -> ActionResult:
+        if op == "rm" and not self.server.container_admin:
+            return ActionResult(ActionOutcome.ERROR, "Remoções pelo painel estão desativadas (container_admin).")
+        new_state = {"pause": ["paused", "Up 3 days (Paused)"], "unpause": ["running", "Up 3 days"]}.get(op)
+        with self._lock:
+            for table in (self._docker, self._podman, self._nerdctl):
+                if service.name in table:
+                    if op == "rm":
+                        del table[service.name]
+                    elif new_state:
+                        table[service.name][:2] = new_state
+        return ActionResult(ActionOutcome.OK, f"{op}: {service.name} — solicitado (demo).")
+
+    def inspect_container(self, service: ServiceInfo) -> str:
+        return json.dumps([{"Name": f"/{service.name}", "Image": service.description,
+                            "State": {"Status": service.active_state, "Running": service.active_state == "running"},
+                            "HostConfig": {"RestartPolicy": {"Name": "unless-stopped"}},
+                            "Config": {"Labels": {"com.docker.compose.project": service.group}}}],
+                          indent=2, ensure_ascii=False)
+
+    def image_op(self, engine_id: str, image: ContainerImage | None, op: str) -> ActionResult:
+        if not self.server.container_admin:
+            return ActionResult(ActionOutcome.ERROR, "Remoções pelo painel estão desativadas (container_admin).")
+        self._removed.add(f"prune:{engine_id}" if op == "prune" else f"image:{engine_id}:{image.reference}")
+        return ActionResult(ActionOutcome.OK, f"{op} — solicitado (demo).")
+
+    def inspect_image(self, engine_id: str, image: ContainerImage) -> str:
+        return json.dumps([{"Id": f"sha256:{image.id}", "RepoTags": [image.reference], "Architecture": "amd64",
+                            "Os": "linux", "Size": image.size_bytes}], indent=2)
+
+    def volume_op(self, engine_id: str, name: str, op: str) -> ActionResult:
+        if not self.server.container_admin:
+            return ActionResult(ActionOutcome.ERROR, "Remoções pelo painel estão desativadas (container_admin).")
+        self._removed.add(f"volume:{engine_id}:{name}")
+        return ActionResult(ActionOutcome.OK, f"Volume {name} removido (demo).")
+
+    def inspect_volume(self, engine_id: str, name: str) -> str:
+        return json.dumps([{"Name": name, "Driver": "local", "Scope": "local",
+                            "Mountpoint": f"/var/lib/docker/volumes/{name}/_data"}], indent=2)
+
+    def check_image_update(self, image: ContainerImage) -> ImageUpdate:
+        time.sleep(0.15)
+        if not engines.updatable(image):
+            return ImageUpdate(image.reference, "ignorada", detail="imagem local, órfã ou sem digest de registro")
+        if "ghcr.io/acme" in image.repository:
+            return ImageUpdate(image.reference, "erro", detail="registro exige login (skopeo login no servidor)")
+        newer = sum(map(ord, image.reference)) % 3 == 0
+        return ImageUpdate(image.reference, "nova versão" if newer else "atualizada", "sha256:" + "0" * 64)
+
+    def console_command(self, service: ServiceInfo) -> str:
+        return engines.build_console_command(service, False)
 
     def list_pods(self) -> RuntimeResult:
         kind = ServiceKind.KUBERNETES

@@ -589,7 +589,8 @@ class TextViewer(ctk.CTkToplevel):
 
     def __init__(self, master, *, title: str, subtitle: str = "", lines: int | None = None,
                  fetch: Callable[[int], Future[str]] | None = None,
-                 command_preview: Callable[[int], str] | None = None, text: str | None = None) -> None:
+                 command_preview: Callable[[int], str] | None = None, text: str | None = None,
+                 line_selector: bool = True) -> None:
         super().__init__(master)
         self.title(title)
         self.geometry("1000x620")
@@ -615,12 +616,14 @@ class TextViewer(ctk.CTkToplevel):
         self._lines = None
         self._reload_btn = None
         if fetch is not None:
-            initial = str(lines or 50)
-            options = list(self.LINE_OPTIONS) if initial in self.LINE_OPTIONS else [initial, *self.LINE_OPTIONS]
-            ctk.CTkLabel(controls, text="Linhas").pack(side="left", padx=(0, 6))
-            self._lines = ctk.CTkOptionMenu(controls, values=options, width=80, command=lambda _v: self.reload())
-            self._lines.set(initial)
-            self._lines.pack(side="left", padx=(0, 8))
+            if line_selector:
+                initial = str(lines or 50)
+                options = list(self.LINE_OPTIONS) if initial in self.LINE_OPTIONS else [initial, *self.LINE_OPTIONS]
+                ctk.CTkLabel(controls, text="Linhas").pack(side="left", padx=(0, 6))
+                self._lines = ctk.CTkOptionMenu(controls, values=options, width=80,
+                                                command=lambda _v: self.reload())
+                self._lines.set(initial)
+                self._lines.pack(side="left", padx=(0, 8))
             self._reload_btn = ctk.CTkButton(controls, text="Atualizar", width=96, command=self.reload)
             self._reload_btn.pack(side="left", padx=(0, 8))
             self.bind("<F5>", lambda _e: self.reload())
@@ -679,7 +682,8 @@ class TextViewer(ctk.CTkToplevel):
             self._status.configure(text="Falha na consulta", text_color=RED)
             return
         self._set_text(text)
-        self._textbox.see("end")
+        if self._lines is not None:  # logs: mostra o fim; JSON do inspect: o começo
+            self._textbox.see("end")
         if any(hint in text.lower() for hint in self._PERMISSION_HINTS):
             self._status.configure(
                 text="Dica: adicione o usuário SSH ao grupo 'systemd-journal' (ou 'adm') para ver todos os logs.",

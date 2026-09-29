@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from core.commands import validate_kubectl_command, validate_libvirt_uri
+from core.commands import validate_kubectl_command, validate_libvirt_uri, validate_namespace
 
 log = logging.getLogger(__name__)
 
@@ -163,6 +163,19 @@ class ServerConfig:
     libvirt_sudo: bool = False
     lxd: str = "auto"
     lxd_sudo: bool = False
+    #: containerd via nerdctl ("" = namespace padrão da CLI).
+    nerdctl: str = "auto"
+    nerdctl_sudo: bool = False
+    nerdctl_namespace: str = ""
+    #: Runtime CRI (CRI-O/containerd) via crictl — somente leitura; costuma exigir root.
+    cri: str = "auto"
+    cri_sudo: bool = False
+    buildah: str = "auto"
+    buildah_sudo: bool = False
+    #: Skopeo: verificação de atualizações de imagens direto no registro.
+    skopeo: str = "auto"
+    #: Remover contêineres/imagens/volumes parados pelo painel.
+    container_admin: bool = False
     smart: str = "auto"
     smart_sudo: bool = False
     #: Auditoria de segurança (somente leitura).
@@ -362,7 +375,9 @@ _SERVER_KEYS = {
     "password_credential", "key_passphrase_credential",
     "allow_agent", "look_for_keys", "host_key_policy", "use_sudo", "docker", "docker_sudo",
     "podman", "podman_sudo", "kubernetes", "kubectl_command", "kubectl_sudo", "libvirt",
-    "libvirt_uri", "libvirt_sudo", "lxd", "lxd_sudo", "smart", "smart_sudo", "security", "security_sudo",
+    "libvirt_uri", "libvirt_sudo", "lxd", "lxd_sudo", "nerdctl", "nerdctl_sudo", "nerdctl_namespace", "cri",
+    "cri_sudo", "buildah", "buildah_sudo", "skopeo", "container_admin", "smart", "smart_sudo", "security",
+    "security_sudo",
     "security_actions", "endpoints", "bandwidth_quota_gb", "bandwidth_count", "logs_sudo", "network_sudo",
     "process_actions", "process_sudo", "unit_types", "poll_interval_seconds", "critical_services",
     "exclude_services",
@@ -612,6 +627,12 @@ def _parse_server(raw: Any, index: int, base_dir: Path | None, errors: list[str]
 
     kubectl_command = _get(raw, "kubectl_command", str, "kubectl", ctx, errors).strip()
     libvirt_uri = _get(raw, "libvirt_uri", str, "qemu:///system", ctx, errors).strip()
+    nerdctl_namespace = _get(raw, "nerdctl_namespace", str, "", ctx, errors).strip()
+    if nerdctl_namespace:
+        try:
+            validate_namespace(nerdctl_namespace)
+        except ValueError:
+            errors.append(f"{ctx}.nerdctl_namespace: valor inválido {nerdctl_namespace!r}.")
     for key, value, validate in (("kubectl_command", kubectl_command, validate_kubectl_command),
                                  ("libvirt_uri", libvirt_uri, validate_libvirt_uri)):
         try:
@@ -675,6 +696,15 @@ def _parse_server(raw: Any, index: int, base_dir: Path | None, errors: list[str]
         libvirt_sudo=_get(raw, "libvirt_sudo", bool, False, ctx, errors),
         lxd=_get_mode(raw, "lxd", ctx, errors),
         lxd_sudo=_get(raw, "lxd_sudo", bool, False, ctx, errors),
+        nerdctl=_get_mode(raw, "nerdctl", ctx, errors),
+        nerdctl_sudo=_get(raw, "nerdctl_sudo", bool, False, ctx, errors),
+        nerdctl_namespace=nerdctl_namespace,
+        cri=_get_mode(raw, "cri", ctx, errors),
+        cri_sudo=_get(raw, "cri_sudo", bool, False, ctx, errors),
+        buildah=_get_mode(raw, "buildah", ctx, errors),
+        buildah_sudo=_get(raw, "buildah_sudo", bool, False, ctx, errors),
+        skopeo=_get_mode(raw, "skopeo", ctx, errors),
+        container_admin=_get(raw, "container_admin", bool, False, ctx, errors),
         smart=_get_mode(raw, "smart", ctx, errors),
         smart_sudo=_get(raw, "smart_sudo", bool, False, ctx, errors),
         security=_get(raw, "security", bool, True, ctx, errors),

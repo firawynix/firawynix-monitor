@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import re
 import threading
@@ -21,14 +22,17 @@ import paramiko
 
 from config.settings import MAX_COMMAND_TIMEOUT, ServerConfig
 from core import commands as cmd
+from core import containers as engines
 from core import parsers
 from core.models import (
     SYSTEMD_UNIT_TYPES,
     ActionOutcome,
     ActionResult,
+    ContainerImage,
     CronEntry,
     Fail2banJail,
     HostMetrics,
+    ImageUpdate,
     JournalEntry,
     NetworkInfo,
     ProcessInfo,
@@ -375,22 +379,32 @@ class SSHClient:
     # -- runtimes -----------------------------------------------------------
 
     def list_containers(self, runtime: ServiceKind) -> RuntimeResult:
-        mode, use_sudo = self._runtime_config(runtime)
+        """Contêineres de qualquer motor OCI (Docker, Podman, containerd/nerdctl, CRI)."""
+        mode, use_sudo, namespace = self._runtime_config(runtime)
         if mode == "off":
             return RuntimeResult(runtime, RuntimeState.DISABLED)
-        result = self.run(cmd.build_container_ps_command(runtime.value, use_sudo))
+        if runtime is ServiceKind.CRI:
+            command = engines.build_cri_ps_command(use_sudo)
+        else:
+            command = cmd.build_container_ps_command(runtime.value, use_sudo, namespace)
+        result = self.run(command)
         if not result.ok:
-            return RuntimeResult(runtime, *parsers.classify_runtime_error(runtime, result.exit_code, result.output))
-        parse: Callable[[str], list[ServiceInfo]] = (
-            parsers.parse_podman_ps if runtime is ServiceKind.PODMAN else parsers.parse_docker_ps)
+            return _runtime_error(runtime, result)
+        parse: Callable[[str], list[ServiceInfo]] = {
+            ServiceKind.PODMAN: parsers.parse_podman_ps,
+            ServiceKind.CRI: engines.parse_crictl_ps,
+            ServiceKind.NERDCTL: lambda text: parsers.parse_docker_ps(text, ServiceKind.NERDCTL),
+        }.get(runtime, parsers.parse_docker_ps)
         try:
             return RuntimeResult(runtime, RuntimeState.OK, tuple(parse(result.stdout)))
         except ValueError as exc:
             return RuntimeResult(runtime, RuntimeState.ERROR, (), f"Saída inesperada do {runtime.label}: {exc}")
 
     def container_stats(self, runtime: ServiceKind) -> dict[str, tuple[float | None, int | None]]:
-        _mode, use_sudo = self._runtime_config(runtime)
-        result = self.run(cmd.build_container_stats_command(runtime.value, use_sudo))
+        _mode, use_sudo, namespace = self._runtime_config(runtime)
+        if not runtime.manageable:
+            return {}
+        result = self.run(cmd.build_container_stats_command(runtime.value, use_sudo, namespace))
         # Aproveita a saída mesmo com código ≠ 0 (um contêiner pode sumir no meio da coleta).
         return parsers.parse_container_stats(result.stdout)
 
@@ -400,7 +414,7 @@ class SSHClient:
             return RuntimeResult(kind, RuntimeState.DISABLED)
         result = self.run(cmd.build_pods_command(self.server.kubectl_command, self._sudo(self.server.kubectl_sudo)))
         if not result.ok:
-            return RuntimeResult(kind, *parsers.classify_runtime_error(kind, result.exit_code, result.output))
+            return _runtime_error(kind, result)
         return RuntimeResult(kind, RuntimeState.OK, tuple(parsers.parse_pods(result.stdout)))
 
     def list_vms(self) -> RuntimeResult:
@@ -409,7 +423,7 @@ class SSHClient:
             return RuntimeResult(kind, RuntimeState.DISABLED)
         result = self.run(cmd.build_vm_list_command(self.server.libvirt_uri, self._sudo(self.server.libvirt_sudo)))
         if not result.ok:
-            return RuntimeResult(kind, *parsers.classify_runtime_error(kind, result.exit_code, result.output))
+            return _runtime_error(kind, result)
         return RuntimeResult(kind, RuntimeState.OK, tuple(parsers.parse_virsh_list(result.stdout)))
 
     def list_lxd(self) -> RuntimeResult:
@@ -418,7 +432,7 @@ class SSHClient:
             return RuntimeResult(kind, RuntimeState.DISABLED)
         result = self.run(cmd.build_lxd_list_command(self._sudo(self.server.lxd_sudo)))
         if not result.ok:
-            return RuntimeResult(kind, *parsers.classify_runtime_error(kind, result.exit_code, result.output))
+            return _runtime_error(kind, result)
         try:
             _cli, instances, usage = parsers.parse_lxd_list(result.stdout)
         except ValueError as exc:
@@ -436,10 +450,91 @@ class SSHClient:
             ]
         return RuntimeResult(kind, RuntimeState.OK, tuple(instances))
 
-    def _runtime_config(self, runtime: ServiceKind) -> tuple[str, bool]:
-        if runtime is ServiceKind.PODMAN:
-            return self.server.podman, self._sudo(self.server.podman_sudo)
-        return self.server.docker, self._sudo(self.server.docker_sudo)
+    def _runtime_config(self, runtime: ServiceKind) -> tuple[str, bool, str]:
+        """(modo, sudo, namespace) do motor de contêiner."""
+        engine_id = engines.ENGINE_OF_KIND[runtime]
+        namespace = self.server.nerdctl_namespace if runtime is ServiceKind.NERDCTL else ""
+        return engines.engine_mode(self.server, engine_id), engines.engine_sudo(self.server, engine_id), namespace
+
+    # -- motores de contêiner: detecção, inventário, ações ------------------
+
+    def discover_engines(self) -> engines.Discovery:
+        return engines.parse_discovery(self.run(engines.DISCOVERY_CMD).stdout)
+
+    def engine_inventory(self, engine_id: str) -> engines.EngineData:
+        kind = engines.ENGINES[engine_id].kind
+        _mode, use_sudo, namespace = self._runtime_config(kind)
+        output = self.run(engines.build_engine_inventory_command(engine_id, use_sudo, namespace)).stdout
+        return engines.parse_engine_inventory(engine_id, output)
+
+    def buildah_inventory(self) -> tuple:
+        output = self.run(engines.build_buildah_command(engines.engine_sudo(self.server, "buildah"))).stdout
+        return engines.parse_buildah(output)
+
+    def _admin_guard(self, op: str) -> ActionResult | None:
+        if op in engines.DESTRUCTIVE_OPS and not self.server.container_admin:
+            return ActionResult(ActionOutcome.ERROR, "Remoções pelo painel estão desativadas (container_admin).")
+        return None
+
+    def container_op(self, service: ServiceInfo, op: str) -> ActionResult:
+        """pause / unpause / rm — o mesmo para Docker, Podman e containerd."""
+        if not service.kind.manageable:
+            return ActionResult(ActionOutcome.ERROR, f"{service.kind.label}: somente leitura.")
+        blocked = self._admin_guard(op)
+        if blocked is not None:
+            return blocked
+        _mode, use_sudo, namespace = self._runtime_config(service.kind)
+        label = {"pause": "Pausar", "unpause": "Retomar", "rm": "Remover"}.get(op, op)
+        return self._run_action(engines.build_container_op_command(service, op, use_sudo, namespace), label,
+                                service.name)
+
+    def inspect_container(self, service: ServiceInfo) -> str:
+        _mode, use_sudo, namespace = self._runtime_config(service.kind)
+        return _pretty_json(self._text_output(engines.build_container_op_command(service, "inspect", use_sudo,
+                                                                                 namespace)))
+
+    def image_op(self, engine_id: str, image: ContainerImage | None, op: str) -> ActionResult:
+        blocked = self._admin_guard(op)
+        if blocked is not None:
+            return blocked
+        _mode, use_sudo, namespace = self._runtime_config(engines.ENGINES[engine_id].kind)
+        command = engines.build_image_op_command(engine_id, image, op, use_sudo, namespace)
+        label = {"rmi": "Remover imagem", "prune": "Limpar imagens órfãs"}.get(op, op)
+        return self._run_action(command, label, image.reference if image else engines.ENGINES[engine_id].label)
+
+    def inspect_image(self, engine_id: str, image: ContainerImage) -> str:
+        _mode, use_sudo, namespace = self._runtime_config(engines.ENGINES[engine_id].kind)
+        return _pretty_json(self._text_output(engines.build_image_op_command(engine_id, image, "inspect", use_sudo,
+                                                                             namespace)))
+
+    def volume_op(self, engine_id: str, name: str, op: str) -> ActionResult:
+        blocked = self._admin_guard(op)
+        if blocked is not None:
+            return blocked
+        _mode, use_sudo, namespace = self._runtime_config(engines.ENGINES[engine_id].kind)
+        return self._run_action(engines.build_volume_op_command(engine_id, name, op, use_sudo, namespace),
+                                "Remover volume", name)
+
+    def inspect_volume(self, engine_id: str, name: str) -> str:
+        _mode, use_sudo, namespace = self._runtime_config(engines.ENGINES[engine_id].kind)
+        return _pretty_json(self._text_output(engines.build_volume_op_command(engine_id, name, "inspect", use_sudo,
+                                                                              namespace)))
+
+    def check_image_update(self, image: ContainerImage) -> ImageUpdate:
+        """Compara o digest local com o do registro via skopeo (não baixa a imagem)."""
+        if not engines.updatable(image):
+            return ImageUpdate(image.reference, "ignorada", detail="imagem local, órfã ou sem digest de registro")
+        try:
+            result = self.run(engines.build_image_update_command(image.reference))
+        except SSHCommandTimeout:
+            return ImageUpdate(image.reference, "erro", detail="o registro não respondeu a tempo")
+        if result.exit_code == 127 or "command not found" in result.output:
+            return ImageUpdate(image.reference, "erro", detail="skopeo não instalado no servidor")
+        return engines.parse_image_update(image.reference, result.stdout, image.digests)
+
+    def console_command(self, service: ServiceInfo) -> str:
+        _mode, use_sudo, namespace = self._runtime_config(service.kind)
+        return engines.build_console_command(service, use_sudo, namespace)
 
     # -- host ---------------------------------------------------------------
 
@@ -513,9 +608,10 @@ class SSHClient:
         server = self.server
         if service.kind is ServiceKind.SYSTEMD:
             command = cmd.build_unit_action_command(service.name, action, self._sudo(server.use_sudo))
-        elif service.kind.is_container:
-            _mode, use_sudo = self._runtime_config(service.kind)
-            command = cmd.build_container_action_command(service.kind.value, [service.name], action, use_sudo)
+        elif service.kind.manageable:
+            _mode, use_sudo, namespace = self._runtime_config(service.kind)
+            command = cmd.build_container_action_command(service.kind.value, [service.name], action, use_sudo,
+                                                         namespace)
         elif service.kind is ServiceKind.KUBERNETES:
             command = cmd.build_pod_restart_command(server.kubectl_command, service.name,
                                                     self._sudo(server.kubectl_sudo))
@@ -528,11 +624,11 @@ class SSHClient:
         return self._run_action(command, action.label, service.name)
 
     def stack_action(self, stack: Stack, action: ServiceAction) -> ActionResult:
-        if not stack.kind.is_container:
+        if not stack.kind.manageable:
             return ActionResult(ActionOutcome.ERROR, "Ações em lote só existem para stacks de contêineres.")
-        _mode, use_sudo = self._runtime_config(stack.kind)
+        _mode, use_sudo, namespace = self._runtime_config(stack.kind)
         names = [member.name for member in stack.members]
-        command = cmd.build_container_action_command(stack.kind.value, names, action, use_sudo)
+        command = cmd.build_container_action_command(stack.kind.value, names, action, use_sudo, namespace)
         return self._run_action(command, action.label, f"stack {stack.name} ({len(names)} contêineres)")
 
     def kill_process(self, pid: int, force: bool) -> ActionResult:
@@ -566,9 +662,12 @@ class SSHClient:
         server = self.server
         if service.kind is ServiceKind.SYSTEMD:
             return cmd.build_journal_command(service.name, lines, self._sudo(server.logs_sudo))
+        if service.kind is ServiceKind.CRI:
+            _mode, use_sudo, _ns = self._runtime_config(service.kind)
+            return cmd.build_cri_logs_command(service.meta_value("id"), lines, use_sudo)
         if service.kind.is_container:
-            _mode, use_sudo = self._runtime_config(service.kind)
-            return cmd.build_container_logs_command(service.kind.value, service.name, lines, use_sudo)
+            _mode, use_sudo, namespace = self._runtime_config(service.kind)
+            return cmd.build_container_logs_command(service.kind.value, service.name, lines, use_sudo, namespace)
         if service.kind is ServiceKind.KUBERNETES:
             return cmd.build_pod_logs_command(server.kubectl_command, service.name, lines,
                                               self._sudo(server.kubectl_sudo))
@@ -581,12 +680,12 @@ class SSHClient:
         return self._text_output(self.logs_command(service, lines))
 
     def stack_logs(self, stack: Stack, lines: int) -> str:
-        if not stack.kind.is_container:
+        if not stack.kind.manageable:
             return "\n\n".join(f"===== {m.name} =====\n{self.service_logs(m, lines)}" for m in stack.members[:10])
-        _mode, use_sudo = self._runtime_config(stack.kind)
+        _mode, use_sudo, namespace = self._runtime_config(stack.kind)
         per_container = max(10, lines // max(1, len(stack.members)))
         command = cmd.build_stack_logs_command(stack.kind.value, [m.name for m in stack.members],
-                                               per_container, use_sudo)
+                                               per_container, use_sudo, namespace)
         return self._text_output(command)
 
     def _text_output(self, command: str) -> str:
@@ -597,6 +696,22 @@ class SSHClient:
             prefix = f"[código de saída {result.exit_code}]"
             return f"{prefix} {hint}\n\n{text}" if hint else f"{prefix}\n{text}"
         return text or "(sem entradas de log)"
+
+
+def _runtime_error(kind: ServiceKind, result: CommandResult) -> RuntimeResult:
+    """Falha de um runtime → estado + dica (a mensagem vai em ``message``, não em ``items``)."""
+    state, message = parsers.classify_runtime_error(kind, result.exit_code, result.output)
+    return RuntimeResult(kind, state, (), message)
+
+def _pretty_json(text: str) -> str:
+    """Saídas de ``inspect`` (JSON) indentadas para leitura; outros textos intactos."""
+    stripped = text.strip()
+    if stripped.startswith(("[", "{")):
+        try:
+            return json.dumps(json.loads(stripped), indent=2, ensure_ascii=False)
+        except ValueError:
+            pass
+    return text
 
 
 def _short(command: str, limit: int = 120) -> str:

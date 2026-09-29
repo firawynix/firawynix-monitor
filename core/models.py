@@ -18,6 +18,10 @@ class ServiceKind(StrEnum):
     KUBERNETES = "k8s"
     LIBVIRT = "vm"
     LXD = "lxd"
+    #: containerd via nerdctl (CLI compatível com o Docker).
+    NERDCTL = "nerdctl"
+    #: Contêineres do Kubernetes vistos direto no runtime CRI (CRI-O/containerd) via crictl.
+    CRI = "cri"
 
     @property
     def label(self) -> str:
@@ -25,7 +29,15 @@ class ServiceKind(StrEnum):
 
     @property
     def is_container(self) -> bool:
-        return self in (ServiceKind.DOCKER, ServiceKind.PODMAN)
+        """Contêineres OCI (aparecem na aba Contêineres, qualquer que seja o motor)."""
+        return self in _OCI_KINDS
+
+    @property
+    def manageable(self) -> bool:
+        """Motores com CLI no estilo Docker: iniciar/parar/pausar/remover pelo painel.
+
+        Contêineres CRI são administrados pelo kubelet: somente leitura."""
+        return self in (ServiceKind.DOCKER, ServiceKind.PODMAN, ServiceKind.NERDCTL)
 
 
 _KIND_LABELS = {
@@ -35,7 +47,10 @@ _KIND_LABELS = {
     ServiceKind.KUBERNETES: "Kubernetes",
     ServiceKind.LIBVIRT: "VM",
     ServiceKind.LXD: "LXD/Incus",
+    ServiceKind.NERDCTL: "containerd",
+    ServiceKind.CRI: "CRI",
 }
+_OCI_KINDS = frozenset({ServiceKind.DOCKER, ServiceKind.PODMAN, ServiceKind.NERDCTL, ServiceKind.CRI})
 
 #: Tipos de unidade systemd coletados por padrão.
 SYSTEMD_UNIT_TYPES = ("service", "timer", "socket", "mount", "path")
@@ -149,7 +164,8 @@ class ServiceInfo:
         if self.kind is ServiceKind.KUBERNETES:
             # Pods não "iniciam/param": reiniciar = excluir e deixar o controlador recriar.
             return action is ServiceAction.RESTART
-        return True
+        # CRI: o kubelet recria o que for parado à mão (somente leitura).
+        return self.kind is not ServiceKind.CRI
 
 
 @dataclass(frozen=True, slots=True)
@@ -622,6 +638,154 @@ class SecurityReport:
         return next((c for c in self.checks if c.id == check_id), None)
 
 
+# ---------------------------------------------------------------------------
+# Motores de contêiner (camada única para Docker, Podman, containerd, CRI...)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class ContainerImage:
+    engine: str
+    id: str
+    repository: str
+    tag: str
+    size_bytes: int | None = None
+    created: str = ""
+    #: Digests do registro (repo@sha256:...) usados para detectar atualizações.
+    digests: tuple[str, ...] = ()
+    #: None = desconhecido; o parser não sabe, a camada de inventário calcula.
+    in_use: bool | None = None
+
+    @property
+    def dangling(self) -> bool:
+        return self.repository in ("", "<none>") or self.tag == "<none>"
+
+    @property
+    def reference(self) -> str:
+        """``repo:tag`` (ou o ID para imagens órfãs)."""
+        return self.id if self.dangling else f"{self.repository}:{self.tag}" if self.tag else self.repository
+
+    @property
+    def key(self) -> str:
+        return f"{self.engine}:{self.id}:{self.reference}"
+
+
+@dataclass(frozen=True, slots=True)
+class ContainerVolume:
+    engine: str
+    name: str
+    driver: str = "local"
+    mountpoint: str = ""
+    #: Projeto do Compose que criou o volume (rótulo), se houver.
+    stack: str = ""
+    in_use: bool | None = None
+
+    @property
+    def key(self) -> str:
+        return f"{self.engine}:{self.name}"
+
+
+@dataclass(frozen=True, slots=True)
+class ContainerNetwork:
+    engine: str
+    name: str
+    driver: str = ""
+    scope: str = ""
+    subnets: tuple[str, ...] = ()
+    containers: int | None = None
+    internal: bool = False
+    id: str = ""
+
+    @property
+    def key(self) -> str:
+        return f"{self.engine}:{self.name}"
+
+
+@dataclass(frozen=True, slots=True)
+class BuildContainer:
+    """Contêiner de trabalho do Buildah (build em andamento/parado)."""
+
+    id: str
+    name: str
+    image: str
+
+
+@dataclass(frozen=True, slots=True)
+class EngineDiskUsage:
+    engine: str
+    kind: str
+    total: int | None
+    active: int | None
+    size: str
+    reclaimable: str
+
+
+@dataclass(frozen=True, slots=True)
+class DetectedTool:
+    """Binário encontrado no servidor pela auto-detecção."""
+
+    id: str
+    path: str
+    version: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class EngineStatus:
+    """Estado de um motor/ferramenta para o painel (igual para todos os motores)."""
+
+    id: str
+    label: str
+    role: str
+    mode: str
+    installed: bool | None
+    version: str = ""
+    #: None = não se aplica (ferramenta sem daemon) ou ainda não consultado.
+    state: RuntimeState | None = None
+    message: str = ""
+    rootless: bool | None = None
+    containers: int = 0
+    running: int = 0
+
+    @property
+    def active(self) -> bool:
+        return bool(self.installed) and self.mode != "off"
+
+
+@dataclass(frozen=True, slots=True)
+class ManagementTool:
+    """Painel web de terceiros encontrado no servidor (Portainer, Cockpit...)."""
+
+    name: str
+    source: str
+    url: str = ""
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class ContainerInventory:
+    engines: tuple[EngineStatus, ...] = ()
+    images: tuple[ContainerImage, ...] = ()
+    volumes: tuple[ContainerVolume, ...] = ()
+    networks: tuple[ContainerNetwork, ...] = ()
+    builds: tuple[BuildContainer, ...] = ()
+    disk: tuple[EngineDiskUsage, ...] = ()
+    tools: tuple[ManagementTool, ...] = ()
+    detected_at: float | None = None
+    collected_at: float | None = None
+
+    def engine(self, engine_id: str) -> EngineStatus | None:
+        return next((e for e in self.engines if e.id == engine_id), None)
+
+
+@dataclass(frozen=True, slots=True)
+class ImageUpdate:
+    """Resultado da comparação (skopeo) do digest local com o do registro."""
+
+    reference: str
+    status: str
+    remote_digest: str = ""
+    detail: str = ""
+
+
 @dataclass(frozen=True, slots=True)
 class Stack:
     """Projeto do Docker/Podman Compose ou namespace do Kubernetes."""
@@ -704,6 +868,7 @@ class HostSnapshot:
     smart: SmartReport | None = None
     security: SecurityReport | None = None
     endpoints: tuple[EndpointResult, ...] = ()
+    containers: ContainerInventory | None = None
     #: Latência medida a partir do Windows (ICMP) ou pela abertura de canais SSH.
     latency_ms: float | None = None
     latency_method: str = ""
