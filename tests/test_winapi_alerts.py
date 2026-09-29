@@ -41,6 +41,7 @@ def test_struct_layouts_match_windows_x64():
     assert ctypes.sizeof(winapi.FLASHWINFO) == 32 and winapi.FLASHWINFO.hwnd.offset == 8
     assert ctypes.sizeof(winapi.IP_OPTION_INFORMATION) == 16
     assert ctypes.sizeof(winapi.ICMP_ECHO_REPLY) == 40 and winapi.ICMP_ECHO_REPLY.Data.offset == 16
+    assert ctypes.sizeof(winapi.DATA_BLOB) == 16 and winapi.DATA_BLOB.pbData.offset == 8  # DPAPI
 
 
 def test_colorref_and_ipaddr():

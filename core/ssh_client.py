@@ -24,6 +24,7 @@ from config.settings import MAX_COMMAND_TIMEOUT, ServerConfig
 from core import commands as cmd
 from core import containers as engines
 from core import parsers
+from core.connectors import ConnectorError, Tunnel, open_tunnel
 from core.models import (
     SYSTEMD_UNIT_TYPES,
     ActionOutcome,
@@ -73,7 +74,15 @@ class SSHConnectionError(SSHError):
 
 
 class SSHAuthError(SSHConnectionError):
-    """Credenciais recusadas (chave, agente ou senha)."""
+    """Credenciais recusadas (chave, agente ou senha) ou ação do usuário necessária.
+
+    ``needs``: "password"/"passphrase" (pedir na interface) ou "cloudflare-login"."""
+
+    def __init__(self, message: str, *, needs: str = "", target: str = "") -> None:
+        super().__init__(message)
+        self.needs = needs
+        #: Servidor (ou host de salto) ao qual o segredo pertence.
+        self.target = target
 
 
 class SSHHostKeyError(SSHConnectionError):
@@ -137,6 +146,7 @@ class SSHClient:
         self._lock = threading.RLock()
         self._state_lock = threading.Lock()
         self._client: paramiko.SSHClient | None = None
+        self._tunnel: Tunnel | None = None
         self._systemctl_json: bool | None = None
         self._cgroup_v2: bool | None = None
         self._metrics_state: parsers.MetricsState | None = None
@@ -176,57 +186,164 @@ class SSHClient:
 
             server = self.server
             try:
-                client.connect(
-                    hostname=server.host,
-                    port=server.port,
-                    username=server.username,
-                    password=server.resolve_password(),
-                    key_filename=str(server.key_file) if server.key_file else None,
-                    passphrase=server.resolve_passphrase(),
-                    timeout=self.connect_timeout,
-                    banner_timeout=self.connect_timeout,
-                    auth_timeout=self.connect_timeout,
-                    channel_timeout=self.command_timeout,
-                    allow_agent=server.allow_agent,
-                    look_for_keys=server.look_for_keys,
-                )
-            except paramiko.BadHostKeyException as exc:
+                auth = self._auth_kwargs(server)
+                tunnel = self._open_path(server)
+            except BaseException:
                 client.close()
-                raise SSHHostKeyError(
-                    f"A chave SSH de {server.host} MUDOU (possível ataque man-in-the-middle). "
-                    "Conexão recusada. Se a troca foi legítima, remova a entrada antiga do "
-                    "known_hosts."
-                ) from exc
-            except paramiko.AuthenticationException as exc:
+                raise
+            try:
+                client.connect(hostname=server.host, port=server.port, username=server.username,
+                               sock=tunnel.sock if tunnel else None, timeout=self.connect_timeout,
+                               banner_timeout=self.connect_timeout, auth_timeout=self.connect_timeout,
+                               channel_timeout=self.command_timeout, **auth)
+            except BaseException as exc:
                 client.close()
-                raise SSHAuthError(f"Autenticação recusada para {server.address}: {exc}") from exc
-            except paramiko.SSHException as exc:
-                client.close()
-                if "not found in known_hosts" in str(exc):
-                    raise SSHHostKeyError(
-                        f"Host {server.host} ausente do known_hosts (host_key_policy=strict). "
-                        f"Conecte uma vez com 'ssh {server.username}@{server.host}' para registrá-lo."
-                    ) from exc
-                raise SSHConnectionError(f"Erro SSH com {server.host}: {exc}") from exc
-            except (OSError, EOFError) as exc:  # TimeoutError é subclasse de OSError
-                client.close()
-                if isinstance(exc, TimeoutError):
-                    reason = "tempo esgotado"
-                elif isinstance(exc, paramiko.ssh_exception.NoValidConnectionsError):
-                    reason = "conexão recusada (sshd parado, porta fechada ou firewall)"
-                else:
-                    reason = exc
-                raise SSHConnectionError(f"Não foi possível conectar a {server.host}:{server.port}: {reason}") from exc
+                if tunnel is not None:
+                    tunnel.close()
+                translated = self._translate_connect_error(exc, server, tunnel) if isinstance(exc, Exception) \
+                    else exc
+                if translated is exc:
+                    raise
+                raise translated from exc
 
             transport = client.get_transport()
             if transport is not None:
                 transport.set_keepalive(KEEPALIVE_SECONDS)
             self._client = client
+            self._tunnel = tunnel
             with self._state_lock:
                 self._metrics_state = None
                 self._process_sample = None
                 self._cgroup_sample = None
-            log.info("[%s] conectado a %s", server.name, server.address)
+            via = f" ({tunnel.description})" if tunnel else ""
+            log.info("[%s] conectado a %s%s · autenticação %s", server.name, server.address, via, server.auth)
+
+    # -- autenticação e caminho de rede -------------------------------------
+
+    @staticmethod
+    def _auth_kwargs(server: ServerConfig) -> dict:
+        """Parâmetros do Paramiko conforme o modo de autenticação escolhido.
+
+        * key          — só chave (arquivo ou as padrão de ~/.ssh), sem senha nem agente.
+        * password     — só usuário e senha (sem tentar chaves: evita punição do fail2ban).
+        * key+password — dois fatores (``AuthenticationMethods publickey,password`` no sshd):
+          o Paramiko autentica a chave e completa com a senha. Também aceita
+          keyboard-interactive com a senha.
+        * agent        — agente SSH (Pageant / OpenSSH do Windows).
+        * auto         — o que estiver configurado, como o OpenSSH.
+        """
+        mode = server.auth
+        password = server.resolve_password() if server.uses_password else None
+        if mode in ("password", "key+password") and not password:
+            how = ("digite-a quando o painel pedir" if server.password_prompt
+                   else "grave-a no Gerenciador de Credenciais (Windows ⚙) ou na variável de ambiente")
+            raise SSHAuthError(f"Senha de {server.address} necessária: {how}.", needs="password",
+                               target=server.name)
+        key_file = str(server.key_file) if server.key_file else None
+        passphrase = server.resolve_passphrase()
+        if mode == "password":
+            return {"password": password, "key_filename": None, "passphrase": None, "allow_agent": False,
+                    "look_for_keys": False}
+        if mode == "agent":
+            return {"password": None, "key_filename": None, "passphrase": None, "allow_agent": True,
+                    "look_for_keys": False}
+        if mode in ("key", "key+password"):
+            return {"password": password if mode == "key+password" else None, "key_filename": key_file,
+                    "passphrase": passphrase, "allow_agent": server.allow_agent and key_file is None,
+                    "look_for_keys": key_file is None and server.look_for_keys}
+        return {"password": password, "key_filename": key_file, "passphrase": passphrase,
+                "allow_agent": server.allow_agent, "look_for_keys": server.look_for_keys}
+
+    def _open_path(self, server: ServerConfig) -> Tunnel | None:
+        """Túnel até o sshd (VPN, Cloudflare, proxy, comando ou host de salto)."""
+        connector = server.connector
+        if connector.type == "jump" and connector.jump is not None:
+            return self._open_jump(server)
+        try:
+            return open_tunnel(server, self.connect_timeout)
+        except ConnectorError as exc:
+            if exc.auth:
+                raise SSHAuthError(str(exc), needs="cloudflare-login" if exc.login_hostname else "",
+                                   target=server.name) from exc
+            raise SSHConnectionError(str(exc)) from exc
+
+    def _open_jump(self, server: ServerConfig) -> Tunnel:
+        bastion_config = server.connector.jump
+        bastion = SSHClient(bastion_config, command_timeout=self.command_timeout,
+                            connect_timeout=self.connect_timeout, known_hosts_file=self.known_hosts_file)
+        try:
+            bastion.connect()
+        except SSHAuthError as exc:
+            raise SSHAuthError(f"Host de salto {bastion_config.address}: {exc}", needs=exc.needs,
+                               target=exc.target or bastion_config.name) from exc
+        except SSHConnectionError as exc:
+            raise type(exc)(f"Host de salto {bastion_config.address}: {exc}") from exc
+        try:
+            channel = bastion._transport().open_channel("direct-tcpip", (server.host, server.port),
+                                                        ("127.0.0.1", 0), timeout=self.connect_timeout)
+        except (paramiko.SSHException, OSError) as exc:
+            bastion.close()
+            raise SSHConnectionError(
+                f"O host de salto {bastion_config.host} não conseguiu abrir {server.host}:{server.port} ({exc}). "
+                "Confira o endereço interno e se o sshd do salto permite encaminhamento (AllowTcpForwarding)."
+            ) from exc
+        return Tunnel(channel, bastion.close, f"salto via {bastion_config.address}")
+
+    def _translate_connect_error(self, exc: BaseException, server: ServerConfig,
+                                 tunnel: Tunnel | None) -> BaseException:
+        via = f" (via {tunnel.description})" if tunnel else ""
+        detail = tunnel.diagnostics() if tunnel else ""
+        if isinstance(exc, paramiko.BadHostKeyException):
+            return SSHHostKeyError(
+                f"A chave SSH de {server.host} MUDOU (possível ataque man-in-the-middle). Conexão recusada. "
+                "Se a troca foi legítima, remova a entrada antiga do known_hosts.")
+        if isinstance(exc, paramiko.PasswordRequiredException):
+            if server.key_passphrase_prompt:
+                from config.settings import set_session_secret
+
+                set_session_secret(server.name, "passphrase", None)
+            return SSHAuthError(f"A chave {server.key_file or '(padrão)'} é protegida por passphrase: informe-a "
+                                "(Gerenciador de Credenciais, variável de ambiente ou pedir ao conectar).",
+                                needs="passphrase" if server.key_passphrase_prompt else "", target=server.name)
+        if isinstance(exc, paramiko.AuthenticationException):
+            allowed = set(getattr(exc, "allowed_types", ()) or ())
+            hint = ""
+            if server.auth in ("key", "agent") and "password" in allowed:
+                hint = " O servidor também exige senha (2 fatores): use \"Chave SSH + senha\"."
+            elif server.auth == "password" and "publickey" in allowed:
+                hint = " O servidor exige chave SSH: use \"Chave SSH\" ou \"Chave SSH + senha\"."
+            elif server.auth in ("password", "key+password") and allowed == {"publickey"}:
+                hint = " O servidor não aceita senha (PasswordAuthentication no)."
+            needs = "password" if server.password_prompt and server.auth in ("password", "key+password") else ""
+            if needs:
+                from config.settings import set_session_secret
+
+                set_session_secret(server.name, "password", None)  # senha digitada errada: pedir de novo
+            return SSHAuthError(f"Autenticação recusada para {server.address}{via} "
+                                f"({server.auth_label}): {exc}.{hint}", needs=needs, target=server.name)
+        if isinstance(exc, paramiko.SSHException):
+            if "No authentication methods available" in str(exc):
+                what = {"agent": "o agente SSH não tem chaves carregadas",
+                        "password": "nenhuma senha configurada"}.get(
+                    server.auth, "nenhuma chave SSH encontrada (informe a chave privada ou coloque-a em ~/.ssh)")
+                return SSHAuthError(f"Sem credencial para {server.address}{via} ({server.auth_label}): {what}.",
+                                    target=server.name)
+            if "not found in known_hosts" in str(exc):
+                return SSHHostKeyError(
+                    f"Host {server.host} ausente do known_hosts (host_key_policy=strict). "
+                    f"Conecte uma vez com 'ssh {server.username}@{server.host}' para registrá-lo.")
+            suffix = f" — túnel: {detail}" if detail else ""
+            return SSHConnectionError(f"Erro SSH com {server.host}{via}: {exc}{suffix}")
+        if isinstance(exc, (OSError, EOFError)):  # TimeoutError é subclasse de OSError
+            if isinstance(exc, TimeoutError):
+                reason = "tempo esgotado"
+            elif isinstance(exc, paramiko.ssh_exception.NoValidConnectionsError):
+                reason = "conexão recusada (sshd parado, porta fechada ou firewall)"
+            else:
+                reason = str(exc)
+            suffix = f" — túnel: {detail}" if detail else ""
+            return SSHConnectionError(f"Não foi possível conectar a {server.host}:{server.port}{via}: {reason}{suffix}")
+        return exc
 
     def close(self) -> None:
         with self._lock:
@@ -239,6 +356,12 @@ class SSHClient:
             except Exception:  # noqa: BLE001 - fechamento best-effort
                 log.debug("Erro ao fechar conexão", exc_info=True)
             self._client = None
+        if self._tunnel is not None:
+            try:
+                self._tunnel.close()
+            except Exception:  # noqa: BLE001
+                log.debug("Erro ao fechar o túnel", exc_info=True)
+            self._tunnel = None
 
     def _transport(self) -> paramiko.Transport:
         client = self._client
@@ -535,6 +658,12 @@ class SSHClient:
     def console_command(self, service: ServiceInfo) -> str:
         _mode, use_sudo, namespace = self._runtime_config(service.kind)
         return engines.build_console_command(service, use_sudo, namespace)
+
+    def change_backend(self):
+        """Operações das mudanças seguras (inspect, jobs em segundo plano, backups)."""
+        from core.change_runner import SSHChangeBackend
+
+        return SSHChangeBackend(self)
 
     # -- host ---------------------------------------------------------------
 

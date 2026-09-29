@@ -21,6 +21,10 @@
 #                 docker logs --tail <N> --timestamps <contêiner>
 #                 docker exec -it <contêiner> sh -c ...          (botão Console)
 #     + container_admin: docker rm|rmi <alvo> | docker image prune -f | docker volume rm <volume>
+#     mudanças seguras (Parar/Iniciar/Reiniciar/Remover/Novo/Restaurar com análise de risco):
+#                 docker inspect --size <c> | docker stop|restart -t 10|30 <c> | docker commit <c> <img>
+#                 firawynix-volume-backup <motor> <volume> <arquivo>   (backup dos volumes)
+#     + container_admin: docker pull <img> | docker run -d --name <c> ... | docker network connect
 #   podman_sudo   os mesmos comandos com "podman" (listagens usam "--format json")
 #   nerdctl_sudo  os mesmos com "nerdctl [--namespace <ns>]"
 #   cri_sudo      crictl ps -a -o json | crictl images -o json | crictl inspect|inspecti <id>
@@ -152,6 +156,28 @@ monitor ALL=(root) NOPASSWD: FWX_NGINX, FWX_APP
 # Console (shell DENTRO do contêiner; opcional):
 # Cmnd_Alias FWX_DOCKER_SHELL = /usr/bin/docker exec -it * sh -c command -v bash >/dev/null 2>&1 && exec bash || exec sh
 # monitor ALL=(root) NOPASSWD: FWX_DOCKER_READ, FWX_DOCKER_CTL
+#
+# Mudanças seguras (aba Contêineres). Toda ação passa por análise de risco,
+# backup e verificação; parar usa desligamento gracioso (10 s, ou 30 s para
+# bancos de dados) e o snapshot é um "docker commit" para firawynix/backup-*:
+# Cmnd_Alias FWX_DOCKER_CHANGE = /usr/bin/docker stop -t 10 *, /usr/bin/docker stop -t 30 *, \
+#     /usr/bin/docker restart -t 10 *, /usr/bin/docker restart -t 30 *, \
+#     /usr/bin/docker commit * firawynix/backup-*
+# Backup dos volumes com o contêiner parado: NÃO libere "docker run" para isso;
+# instale o script docs/firawynix-volume-backup (valida motor, volume e arquivo,
+# monta o volume somente leitura num alpine sem rede e grava só em
+# /var/backups/firawynix):
+# Cmnd_Alias FWX_BACKUP = /usr/local/sbin/firawynix-volume-backup
+# monitor ALL=(root) NOPASSWD: FWX_DOCKER_CHANGE, FWX_BACKUP
+#
+# Novo contêiner e Restaurar (só com "container_admin": true). ATENÇÃO: "docker
+# run" liberado no sudoers permite criar um contêiner privilegiado, ou seja,
+# equivale a root. O painel mostra o risco (privileged, docker.sock, "/" do
+# host, rede do host) antes de executar, mas a regra vale para qualquer uso da
+# conta. Libere só em servidores onde a conta de monitoramento é de confiança:
+# Cmnd_Alias FWX_DOCKER_CREATE = /usr/bin/docker pull *, /usr/bin/docker run -d --name *, \
+#     /usr/bin/docker network connect *
+# monitor ALL=(root) NOPASSWD: FWX_DOCKER_CREATE
 #
 # Podman: rootless (contêineres do próprio usuário "monitor") dispensa sudo. Para
 # contêineres do root, repita as regras acima com /usr/bin/podman e "--format json"

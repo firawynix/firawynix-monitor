@@ -69,6 +69,10 @@ class CREDENTIALW(Structure):
     ]
 
 
+class DATA_BLOB(Structure):  # noqa: N801 - nome da API
+    _fields_ = [("cbData", c_uint32), ("pbData", POINTER(c_ubyte))]
+
+
 class FLASHWINFO(Structure):
     _fields_ = [("cbSize", c_uint32), ("hwnd", c_void_p), ("dwFlags", c_uint32), ("uCount", c_uint32),
                 ("dwTimeout", c_uint32)]
@@ -101,6 +105,7 @@ _user32 = _dll("user32")
 _kernel32 = _dll("kernel32")
 _dwmapi = _dll("dwmapi")
 _iphlpapi = _dll("iphlpapi")
+_crypt32 = _dll("crypt32")
 
 if _advapi32 is not None:
     _advapi32.CredWriteW.argtypes = (POINTER(CREDENTIALW), c_uint32)
@@ -121,6 +126,16 @@ if _advapi32 is not None:
     _advapi32.ReportEventW.restype = ctypes.c_int
     _advapi32.DeregisterEventSource.argtypes = (c_void_p,)
     _advapi32.DeregisterEventSource.restype = ctypes.c_int
+if _crypt32 is not None:
+    _crypt32.CryptProtectData.argtypes = (POINTER(DATA_BLOB), c_wchar_p, c_void_p, c_void_p, c_void_p, c_uint32,
+                                          POINTER(DATA_BLOB))
+    _crypt32.CryptProtectData.restype = ctypes.c_int
+    _crypt32.CryptUnprotectData.argtypes = (POINTER(DATA_BLOB), c_void_p, c_void_p, c_void_p, c_void_p, c_uint32,
+                                            POINTER(DATA_BLOB))
+    _crypt32.CryptUnprotectData.restype = ctypes.c_int
+if _kernel32 is not None:
+    _kernel32.LocalFree.argtypes = (c_void_p,)
+    _kernel32.LocalFree.restype = c_void_p
 if _user32 is not None:
     _user32.GetParent.argtypes = (c_void_p,)
     _user32.GetParent.restype = c_void_p
@@ -189,6 +204,12 @@ def cred_write(target: str, secret: str, username: str = "") -> None:
 
 
 def cred_read(target: str) -> str | None:
+    pair = cred_read_pair(target)
+    return pair[1] if pair is not None else None
+
+
+def cred_read_pair(target: str) -> tuple[str, str] | None:
+    """``(usuário, segredo)`` — ex.: token de serviço do Cloudflare (usuário = ID, senha = segredo)."""
     if _advapi32 is None:
         return None
     pointer = POINTER(CREDENTIALW)()
@@ -200,9 +221,50 @@ def cred_read(target: str) -> str | None:
     try:
         credential = pointer.contents
         blob = ctypes.string_at(credential.CredentialBlob, credential.CredentialBlobSize)
-        return decode_secret(blob)
+        return credential.UserName or "", decode_secret(blob)
     finally:
         _advapi32.CredFree(pointer)
+
+
+# ---------------------------------------------------------------------------
+# DPAPI: arquivos locais legíveis só pelo usuário do Windows (backups de definição)
+# ---------------------------------------------------------------------------
+
+_CRYPTPROTECT_UI_FORBIDDEN = 0x1
+
+
+def _blob(data: bytes) -> tuple[DATA_BLOB, object]:
+    buffer = (c_ubyte * max(1, len(data))).from_buffer_copy(data or b"\0")
+    return DATA_BLOB(len(data), ctypes.cast(buffer, POINTER(c_ubyte))), buffer
+
+
+def protect_data(data: bytes, description: str = "Firawynix Monitor") -> bytes:
+    """Criptografa com a chave do usuário do Windows (DPAPI, ``CryptProtectData``)."""
+    if _crypt32 is None:
+        raise CredentialError("DPAPI só existe no Windows.")
+    source, _keep = _blob(data)
+    out = DATA_BLOB()
+    if not _crypt32.CryptProtectData(byref(source), description, None, None, None, _CRYPTPROTECT_UI_FORBIDDEN,
+                                     byref(out)):
+        raise CredentialError(f"CryptProtectData falhou (erro {ctypes.get_last_error()}).")
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        _kernel32.LocalFree(ctypes.cast(out.pbData, c_void_p))
+
+
+def unprotect_data(data: bytes) -> bytes:
+    if _crypt32 is None:
+        raise CredentialError("DPAPI só existe no Windows.")
+    source, _keep = _blob(data)
+    out = DATA_BLOB()
+    if not _crypt32.CryptUnprotectData(byref(source), None, None, None, None, _CRYPTPROTECT_UI_FORBIDDEN,
+                                       byref(out)):
+        raise CredentialError(f"CryptUnprotectData falhou (erro {ctypes.get_last_error()}).")
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        _kernel32.LocalFree(ctypes.cast(out.pbData, c_void_p))
 
 
 def cred_delete(target: str) -> bool:

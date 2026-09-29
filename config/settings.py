@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -38,10 +39,40 @@ UNIT_TYPES = ("service", "timer", "socket", "mount", "path")
 LATENCY_PROBES = ("auto", "icmp", "ssh", "off")
 LOGIN_NOTIFY = ("root", "all", "off")
 BANDWIDTH_COUNT = ("tx", "total")
+#: Como autenticar no SSH. "auto" tenta o que estiver configurado (chave, agente, senha).
+AUTH_MODES = ("auto", "key", "password", "key+password", "agent")
+AUTH_LABELS = {"auto": "Automático", "key": "Chave SSH", "password": "Usuário e senha",
+               "key+password": "Chave SSH + senha (2 fatores)", "agent": "Agente SSH (Pageant/OpenSSH)"}
+#: Como chegar ao sshd: direto, por VPN, Cloudflare Tunnel, host de salto, proxy ou comando.
+CONNECTOR_TYPES = ("direct", "vpn", "cloudflared", "jump", "socks5", "http", "command")
+CONNECTOR_LABELS = {"direct": "Direto", "vpn": "VPN (WireGuard, Tailscale, OpenVPN…)",
+                    "cloudflared": "Cloudflare Tunnel (cloudflared)", "jump": "Host de salto (bastion)",
+                    "socks5": "Proxy SOCKS5", "http": "Proxy HTTP (CONNECT)", "command": "Comando (ProxyCommand)"}
 
 
 class ConfigError(Exception):
     """Arquivo de configuração ausente ou inválido."""
+
+
+# ---------------------------------------------------------------------------
+# Segredos digitados na interface ("pedir ao conectar"): só em memória, nunca em disco
+# ---------------------------------------------------------------------------
+
+_SESSION_SECRETS: dict[tuple[str, str], str] = {}
+_SESSION_LOCK = threading.Lock()
+
+
+def set_session_secret(server: str, kind: str, value: str | None) -> None:
+    with _SESSION_LOCK:
+        if value:
+            _SESSION_SECRETS[(server, kind)] = value
+        else:
+            _SESSION_SECRETS.pop((server, kind), None)
+
+
+def get_session_secret(server: str, kind: str) -> str | None:
+    with _SESSION_LOCK:
+        return _SESSION_SECRETS.get((server, kind))
 
 
 @dataclass(frozen=True)
@@ -136,6 +167,71 @@ class AppSettings:
 
 
 @dataclass(frozen=True)
+class ConnectorConfig:
+    """Caminho de rede até o sshd. Os segredos (token do Cloudflare, senha do proxy)
+    seguem a regra do resto do arquivo: nome de variável de ambiente ou credencial do Windows."""
+
+    type: str = "direct"
+    #: Nome exibido (ex.: "WireGuard escritório").
+    name: str = ""
+    # -- vpn: endereço testado antes do SSH (padrão: o próprio host:porta) e comando que a liga
+    check_host: str = ""
+    check_port: int = 0
+    up_command: tuple[str, ...] = ()
+    # -- cloudflared: aplicação do Cloudflare Access e token de serviço (opcional)
+    hostname: str = ""
+    destination: str = ""
+    executable: str = ""
+    token_id_env: str | None = None
+    token_secret_env: str | None = None
+    token_credential: str | None = None
+    # -- socks5 / http
+    host: str = ""
+    port: int = 0
+    username: str = ""
+    password_env: str | None = None
+    password_credential: str | None = None
+    # -- command: argv com %h (host), %p (porta) e %r (usuário)
+    command: tuple[str, ...] = ()
+    # -- jump: conexão SSH com o host de salto (tem autenticação própria)
+    jump: ServerConfig | None = None
+
+    @property
+    def is_direct(self) -> bool:
+        return self.type == "direct"
+
+    def label(self, server_host: str = "") -> str:
+        if self.type == "direct":
+            return "direto"
+        if self.type == "vpn":
+            return f"VPN {self.name}".strip() if self.name else "VPN"
+        if self.type == "cloudflared":
+            return f"Cloudflare Tunnel ({self.hostname or server_host})"
+        if self.type == "jump" and self.jump is not None:
+            return f"salto via {self.jump.username}@{self.jump.host}:{self.jump.port}"
+        if self.type in ("socks5", "http"):
+            return f"{'SOCKS5' if self.type == 'socks5' else 'proxy HTTP'} {self.host}:{self.port}"
+        if self.type == "command":
+            return f"comando {Path(self.command[0]).name}" if self.command else "comando"
+        return self.type
+
+    def resolve_proxy_password(self) -> str | None:
+        return _read_secret(self.password_env) or _read_credential(self.password_credential)
+
+    def resolve_service_token(self) -> tuple[str, str] | None:
+        """(ID, segredo) do token de serviço do Cloudflare Access, se configurado."""
+        if self.token_id_env or self.token_secret_env:
+            token_id, secret = _read_secret(self.token_id_env), _read_secret(self.token_secret_env)
+            return (token_id, secret) if token_id and secret else None
+        if self.token_credential:
+            from core.winapi import IS_WINDOWS, cred_read_pair
+
+            pair = cred_read_pair(self.token_credential) if IS_WINDOWS else None
+            return pair if pair and pair[0] and pair[1] else None
+        return None
+
+
+@dataclass(frozen=True)
 class ServerConfig:
     name: str
     host: str
@@ -150,6 +246,12 @@ class ServerConfig:
     allow_agent: bool = True
     look_for_keys: bool = True
     host_key_policy: str = "accept-new"
+    #: Modo de autenticação (veja AUTH_MODES).
+    auth: str = "auto"
+    #: Pedir a senha / passphrase na interface ao conectar (fica só em memória).
+    password_prompt: bool = False
+    key_passphrase_prompt: bool = False
+    connector: ConnectorConfig = field(default_factory=ConnectorConfig)
     use_sudo: bool = True
     docker: str = "auto"
     docker_sudo: bool = False
@@ -203,13 +305,19 @@ class ServerConfig:
 
     @property
     def uses_password(self) -> bool:
-        return bool(self.password_env or self.password_credential)
+        return bool(self.password_env or self.password_credential or self.password_prompt)
+
+    @property
+    def auth_label(self) -> str:
+        return AUTH_LABELS.get(self.auth, self.auth)
 
     def resolve_password(self) -> str | None:
-        return _read_secret(self.password_env) or _read_credential(self.password_credential)
+        return (_read_secret(self.password_env) or _read_credential(self.password_credential)
+                or (get_session_secret(self.name, "password") if self.password_prompt else None))
 
     def resolve_passphrase(self) -> str | None:
-        return _read_secret(self.key_passphrase_env) or _read_credential(self.key_passphrase_credential)
+        return (_read_secret(self.key_passphrase_env) or _read_credential(self.key_passphrase_credential)
+                or (get_session_secret(self.name, "passphrase") if self.key_passphrase_prompt else None))
 
 
 @dataclass(frozen=True)
@@ -380,7 +488,21 @@ _SERVER_KEYS = {
     "security_sudo",
     "security_actions", "endpoints", "bandwidth_quota_gb", "bandwidth_count", "logs_sudo", "network_sudo",
     "process_actions", "process_sudo", "unit_types", "poll_interval_seconds", "critical_services",
-    "exclude_services",
+    "exclude_services", "auth", "password_prompt", "key_passphrase_prompt", "connector",
+}
+#: Chaves de conexão aceitas no host de salto (connector.type = "jump").
+_JUMP_KEYS = {"host", "port", "username", "key_file", "key_passphrase_env", "key_passphrase_credential",
+              "password_env", "password_credential", "password_prompt", "key_passphrase_prompt", "auth",
+              "allow_agent", "look_for_keys", "host_key_policy"}
+_CONNECTOR_KEYS = {
+    "direct": set(),
+    "vpn": {"check", "up_command"},
+    "cloudflared": {"hostname", "destination", "cloudflared_path", "service_token_id_env",
+                    "service_token_secret_env", "service_token_credential"},
+    "jump": _JUMP_KEYS,
+    "socks5": {"host", "port", "username", "password_env", "password_credential"},
+    "http": {"host", "port", "username", "password_env", "password_credential"},
+    "command": {"command"},
 }
 _PLAINTEXT_SECRET_KEYS = {"password", "passphrase", "key_passphrase", "sudo_password"}
 
@@ -597,14 +719,15 @@ def _parse_settings(raw: Any, base_dir: Path | None, errors: list[str]) -> AppSe
     )
 
 
-def _parse_server(raw: Any, index: int, base_dir: Path | None, errors: list[str]) -> ServerConfig | None:
-    ctx = f"servers[{index}]"
+def _parse_server(raw: Any, index: int, base_dir: Path | None, errors: list[str], *,
+                  ctx_override: str | None = None, allowed: set[str] | None = None) -> ServerConfig | None:
+    ctx = ctx_override or f"servers[{index}]"
     if not isinstance(raw, dict):
         errors.append(f"{ctx}: deve ser um objeto.")
         return None
-    if isinstance(raw.get("name"), str) and raw["name"].strip():
+    if ctx_override is None and isinstance(raw.get("name"), str) and raw["name"].strip():
         ctx = f"servers[{index}] ('{raw['name'].strip()}')"
-    _reject_unknown(raw, _SERVER_KEYS, ctx, errors)
+    _reject_unknown(raw, allowed or _SERVER_KEYS, ctx, errors)
     error_count = len(errors)
 
     name = _get(raw, "name", str, "", ctx, errors).strip()
@@ -649,19 +772,8 @@ def _parse_server(raw: Any, index: int, base_dir: Path | None, errors: list[str]
         except ValueError as exc:
             errors.append(f"{ctx}.endpoints[{index}]: {endpoint!r} inválido ({exc}).")
 
-    credentials = {}
-    for key, kind in (("password_credential", "password"), ("key_passphrase_credential", "passphrase")):
-        value = raw.get(key)
-        if value is True:
-            from core.winapi import credential_target
-
-            credentials[key] = credential_target(name or "?", kind)
-        elif value in (None, False):
-            credentials[key] = None
-        elif isinstance(value, str) and value.strip():
-            credentials[key] = value.strip()
-        else:
-            errors.append(f"{ctx}.{key}: use true (nome padrão) ou o nome da credencial.")
+    credentials = {key: _get_credential(raw, key, name or "?", kind, ctx, errors)
+                   for key, kind in (("password_credential", "password"), ("key_passphrase_credential", "passphrase"))}
 
     quota = _get_number(raw, "bandwidth_quota_gb", None, 0.001, 10_000_000, ctx, errors)
 
@@ -670,18 +782,37 @@ def _parse_server(raw: Any, index: int, base_dir: Path | None, errors: list[str]
     if invalid_types:
         errors.append(f"{ctx}.unit_types: {', '.join(invalid_types)} inválido(s) (use: {', '.join(UNIT_TYPES)}).")
 
+    auth = _get_choice(raw, "auth", AUTH_MODES, "auto", ctx, errors)
+    password_prompt = _get(raw, "password_prompt", bool, False, ctx, errors)
+    has_password = bool(raw.get("password_env") or credentials.get("password_credential") or password_prompt)
+    look_for_keys = _get(raw, "look_for_keys", bool, True, ctx, errors)
+    allow_agent = _get(raw, "allow_agent", bool, True, ctx, errors)
+    if auth in ("password", "key+password") and not has_password:
+        errors.append(f"{ctx}.auth: '{auth}' exige uma senha — use password_credential (Windows), "
+                      "password_env ou password_prompt (pedir ao conectar).")
+    if auth in ("key", "key+password") and key_file is None and not look_for_keys:
+        errors.append(f"{ctx}.auth: '{auth}' exige key_file (ou look_for_keys: true para as chaves padrão).")
+    if auth == "agent" and not allow_agent:
+        errors.append(f"{ctx}.auth: 'agent' com allow_agent: false não tem como autenticar.")
+    connector = (_parse_connector(raw.get("connector"), ctx, name, username, base_dir, errors)
+                 if "connector" in raw else ConnectorConfig())
+
     server = ServerConfig(
         name=name,
         host=host,
         username=username,
         port=port,
         key_file=key_file,
+        auth=auth,
+        password_prompt=password_prompt,
+        key_passphrase_prompt=_get(raw, "key_passphrase_prompt", bool, False, ctx, errors),
+        connector=connector,
         key_passphrase_env=_get(raw, "key_passphrase_env", str, None, ctx, errors),
         password_env=_get(raw, "password_env", str, None, ctx, errors),
         password_credential=credentials.get("password_credential"),
         key_passphrase_credential=credentials.get("key_passphrase_credential"),
-        allow_agent=_get(raw, "allow_agent", bool, True, ctx, errors),
-        look_for_keys=_get(raw, "look_for_keys", bool, True, ctx, errors),
+        allow_agent=allow_agent,
+        look_for_keys=look_for_keys,
         host_key_policy=_get_choice(raw, "host_key_policy", HOST_KEY_POLICIES, "accept-new", ctx, errors),
         use_sudo=_get(raw, "use_sudo", bool, True, ctx, errors),
         docker=_get_mode(raw, "docker", ctx, errors),
@@ -726,3 +857,114 @@ def _parse_server(raw: Any, index: int, base_dir: Path | None, errors: list[str]
     if len(errors) > error_count:
         return None
     return server
+
+
+def _get_credential(raw: dict, key: str, server: str, kind: str, ctx: str, errors: list[str]) -> str | None:
+    """``true`` = nome padrão (FirawynixMonitor/<servidor>[/tipo]); texto = nome da credencial."""
+    value = raw.get(key)
+    if value is True:
+        from core.winapi import credential_target
+
+        return credential_target(server, kind)
+    if value in (None, False):
+        return None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    errors.append(f"{ctx}.{key}: use true (nome padrão) ou o nome da credencial.")
+    return None
+
+
+def _parse_host_port(value: str) -> tuple[str, int] | None:
+    """``host:porta`` ou ``[ipv6]:porta``."""
+    value = value.strip()
+    if value.startswith("["):
+        host, sep, port = value[1:].partition("]:")
+    else:
+        host, sep, port = value.rpartition(":")
+    if not sep or not host or not port.isdigit() or not 1 <= int(port) <= 65535:
+        return None
+    return host, int(port)
+
+
+def _get_argv(raw: dict, key: str, ctx: str, errors: list[str]) -> tuple[str, ...]:
+    """Comando como lista (sem shell): ["programa", "arg1", ...]."""
+    value = raw.get(key)
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not value or not all(isinstance(v, str) and v for v in value):
+        errors.append(f"{ctx}.{key}: use uma lista não vazia de textos, ex.: [\"programa\", \"argumento\"] "
+                      "(o comando nunca passa por um shell).")
+        return ()
+    return tuple(value)
+
+
+def _parse_connector(raw: Any, ctx: str, server: str, username: str, base_dir: Path | None,
+                     errors: list[str]) -> ConnectorConfig:
+    cctx = f"{ctx}.connector"
+    if isinstance(raw, str):
+        raw = {"type": raw}
+    if not isinstance(raw, dict):
+        errors.append(f"{cctx}: deve ser um objeto, ex.: {{\"type\": \"cloudflared\"}}.")
+        return ConnectorConfig()
+    kind = _get_choice(raw, "type", CONNECTOR_TYPES, "direct", cctx, errors)
+    _reject_unknown(raw, {"type", "name"} | _CONNECTOR_KEYS[kind], cctx, errors)
+    label = _get(raw, "name", str, "", cctx, errors).strip()
+    if kind == "direct":
+        return ConnectorConfig(name=label)
+    if kind == "vpn":
+        check_host, check_port = "", 0
+        check = _get(raw, "check", str, "", cctx, errors)
+        if check:
+            parsed = _parse_host_port(check)
+            if parsed is None:
+                errors.append(f"{cctx}.check: use host:porta (ex.: \"10.8.0.1:22\").")
+            else:
+                check_host, check_port = parsed
+        return ConnectorConfig(type=kind, name=label, check_host=check_host, check_port=check_port,
+                               up_command=_get_argv(raw, "up_command", cctx, errors))
+    if kind == "cloudflared":
+        id_env = _get(raw, "service_token_id_env", str, None, cctx, errors)
+        secret_env = _get(raw, "service_token_secret_env", str, None, cctx, errors)
+        if bool(id_env) != bool(secret_env):
+            errors.append(f"{cctx}: informe service_token_id_env E service_token_secret_env.")
+        hostname = _get(raw, "hostname", str, "", cctx, errors).strip()
+        if hostname and ("/" in hostname or " " in hostname):
+            errors.append(f"{cctx}.hostname: use só o nome do host do Access (ex.: ssh.exemplo.com).")
+        executable = _get(raw, "cloudflared_path", str, "", cctx, errors).strip()
+        return ConnectorConfig(
+            type=kind, name=label, hostname=hostname,
+            destination=_get(raw, "destination", str, "", cctx, errors).strip(),
+            executable=str(_expand_path(executable, base_dir)) if executable and ("/" in executable
+                                                                                  or "\\" in executable)
+            else executable,
+            token_id_env=id_env, token_secret_env=secret_env,
+            token_credential=_get_credential(raw, "service_token_credential", server, "cloudflared", cctx,
+                                             errors))
+    if kind in ("socks5", "http"):
+        host = _get(raw, "host", str, "", cctx, errors).strip()
+        if not host:
+            errors.append(f"{cctx}.host: obrigatório para o proxy.")
+        port = _get(raw, "port", int, 1080 if kind == "socks5" else 3128, cctx, errors)
+        if not 1 <= port <= 65535:
+            errors.append(f"{cctx}.port: {port} inválida.")
+        return ConnectorConfig(type=kind, name=label, host=host, port=port,
+                               username=_get(raw, "username", str, "", cctx, errors).strip(),
+                               password_env=_get(raw, "password_env", str, None, cctx, errors),
+                               password_credential=_get_credential(raw, "password_credential", server, "proxy",
+                                                                   cctx, errors))
+    if kind == "command":
+        command = _get_argv(raw, "command", cctx, errors)
+        if not command and "command" not in raw:
+            errors.append(f"{cctx}.command: obrigatório, ex.: [\"ncat\", \"--proxy\", \"proxy:8080\", \"%h\", \"%p\"].")
+        return ConnectorConfig(type=kind, name=label, command=command)
+    # jump: o host de salto é outro servidor SSH, com autenticação própria.
+    sub = {key: raw[key] for key in _JUMP_KEYS if key in raw}
+    sub.setdefault("username", username)
+    for key, kind_name in (("password_credential", "jump"), ("key_passphrase_credential", "jump-passphrase")):
+        if sub.get(key) is True:
+            from core.winapi import credential_target
+
+            sub[key] = credential_target(server, kind_name)
+    sub["name"] = f"{server} (salto)"
+    jump = _parse_server(sub, 0, base_dir, errors, ctx_override=cctx, allowed=_JUMP_KEYS | {"name"})
+    return ConnectorConfig(type=kind, name=label, jump=jump)

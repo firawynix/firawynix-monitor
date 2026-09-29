@@ -639,3 +639,52 @@ def test_engine_selection_from_the_panel_switches_engines_live():
         assert manager.console_command("srv", svc("web", kind=ServiceKind.DOCKER)) == "docker exec -it web sh"
     finally:
         manager.stop()
+
+
+def test_connection_event_tells_the_ui_which_secret_is_needed():
+    from core.ssh_client import SSHAuthError
+
+    class NeedsPassword(FakeClient):
+        def connect(self):
+            self.connect_calls += 1
+            raise SSHAuthError("Senha necessária", needs="password", target="srv")
+
+    manager = _manager(NeedsPassword())
+    manager.start()
+    try:
+        events = _collect(manager, lambda ev: any(isinstance(e, ConnectionEvent) and e.needs for e in ev))
+    finally:
+        manager.stop()
+    event = next(e for e in events if isinstance(e, ConnectionEvent) and e.needs)
+    assert (event.state, event.needs, event.needs_target) == (ConnectionState.RECONNECTING, "password", "srv")
+    assert event.retry_in >= 20  # segredo ausente: backoff longo; a interface reconecta ao receber a senha
+
+
+def test_apply_config_adds_updates_and_removes_servers_live():
+    import dataclasses
+
+    clients = {}
+
+    def factory(server, _settings):
+        client = FakeClient()
+        client.server = server
+        clients.setdefault(server.name, []).append(client)
+        return client
+
+    settings = AppSettings(poll_interval_seconds=2.0)
+    a, b = ServerConfig(name="a", host="h", username="u"), ServerConfig(name="b", host="h2", username="u")
+    manager = MonitorManager(Config(settings=settings, servers=(a, b)), client_factory=factory)
+    manager.start()
+    try:
+        untouched = manager.monitors["a"]
+        changed_b = dataclasses.replace(b, host="novo-host", auth="password", password_prompt=True)
+        c = ServerConfig(name="c", host="h3", username="u")
+        result = manager.apply_config(Config(settings=settings, servers=(a, changed_b, c)))
+        assert result == {"added": ["c"], "updated": ["b"], "removed": []}
+        assert manager.monitors["a"] is untouched and manager.monitors["b"].server.host == "novo-host"
+        assert len(clients["b"]) == 2 and manager.server_names == ["a", "b", "c"]
+        result = manager.apply_config(Config(settings=settings, servers=(changed_b,)))
+        assert result == {"added": [], "updated": [], "removed": ["a", "c"]}
+        assert manager.server_names == ["b"]
+    finally:
+        manager.stop()

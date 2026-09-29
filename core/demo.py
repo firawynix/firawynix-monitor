@@ -10,10 +10,11 @@ from __future__ import annotations
 import json
 import math
 import random
+import shlex
 import threading
 import time
 
-from config.settings import AppSettings, Config, NotificationSettings, ServerConfig
+from config.settings import AppSettings, Config, ConnectorConfig, NotificationSettings, ServerConfig
 from core import commands as cmd
 from core import containers as engines
 from core.history import HistoryStore
@@ -133,8 +134,17 @@ _DOCKER = {
         ("backup-job", "restic/restic:0.17.1", "", ""),
         ("portainer", "portainer/portainer-ce:2.21.3", "", ""),
         ("watchtower", "containrrr/watchtower:1.7.1", "", ""),
+        ("cloudflared", "cloudflare/cloudflared:2024.9.1", "", ""),
     ],
 }
+#: depends_on do Compose (rótulo com.docker.compose.depends_on) por serviço.
+_DEPENDS = {"api": "redis:service_started:false", "worker": "redis:service_started:false,api:service_started:false",
+            "grafana": "prometheus:service_started:false,loki:service_started:false"}
+#: Volumes nomeados por contêiner (para a análise de risco e os backups).
+_DEMO_VOLUMES = {"shop-redis-1": ("shop_redis-data",), "monitoring-grafana-1": ("monitoring_grafana-data",),
+                 "monitoring-prometheus-1": ("monitoring_prometheus-data",), "portainer": ("portainer_data",),
+                 "pgbouncer": ("pgbouncer-config",), "site-cache": ("site-cache-data",),
+                 "edge-traefik-1": ("edge_letsencrypt",)}
 _DEMO_PORTS = {
     "portainer": "0.0.0.0:9443->9443/tcp, [::]:9443->9443/tcp, 8000/tcp",
     "edge-traefik-1": "0.0.0.0:80->80/tcp, 0.0.0.0:443->443/tcp",
@@ -228,17 +238,24 @@ def demo_config() -> Config:
                            security_interval_seconds=60.0, endpoint_interval_seconds=30.0,
                            notifications=NotificationSettings(cooldown_seconds=30))
     servers = (
-        ServerConfig(name="prod-web-01", host="10.0.10.21", username="monitor", security_sudo=True,
+        ServerConfig(name="prod-web-01", host="ssh.exemplo.com.br", username="monitor", security_sudo=True,
+                     connector=ConnectorConfig(type="cloudflared", hostname="ssh.exemplo.com.br",
+                                               token_credential="FirawynixMonitor/prod-web-01/cloudflared"),
                      security_actions=True, bandwidth_quota_gb=1000, container_admin=True,
                      endpoints=tuple(e[0] for e in _ENDPOINTS["prod-web-01"]),
                      critical_services=("nginx", "gunicorn", "celery*", "docker:shop-*", "docker:edge-*")),
         ServerConfig(name="prod-db-01", host="10.0.10.31", username="monitor", password_env="DEMO_DB_PASSWORD",
+                     auth="key+password", container_admin=True,
+                     connector=ConnectorConfig(type="vpn", name="WireGuard escritório", check_host="10.0.10.1",
+                                               check_port=22),
                      critical_services=("postgresql*", "podman:pgbouncer")),
         ServerConfig(name="k3s-edge", host="10.0.20.11", username="monitor", process_actions=True,
                      security_sudo=True, bandwidth_quota_gb=2000,
                      endpoints=tuple(e[0] for e in _ENDPOINTS["k3s-edge"]),
                      critical_services=("k3s", "k8s:prod/*")),
         ServerConfig(name="hv-01", host="10.0.30.5", username="monitor", smart_sudo=True,
+                     connector=ConnectorConfig(type="jump", jump=ServerConfig(
+                         name="hv-01 (salto)", host="bastion.exemplo.com.br", username="monitor", auth="key")),
                      critical_services=("libvirtd", "vm:win2022-ad", "vm:pfsense-lab", "lxd:gitea")),
         ServerConfig(name="legacy-erp", host="offline.demo.invalid", username="monitor"),
     )
@@ -294,6 +311,8 @@ class DemoClient:
         self._nerdctl = {n: [state, status, image, group] for n, image, group, state, status in _NERDCTL} \
             if server.name == "k3s-edge" else {}
         self._removed: set[str] = set()
+        self._demo_images: set[str] = set()
+        self._demo_jobs: dict[str, list] = {}
         self._lxd = {name: [status, kind, image, ip] for name, status, kind, image, ip in _LXD} \
             if server.name == "hv-01" else {}
         self._banned = {"sshd": ["203.0.113.9", "198.51.100.7"]} if server.name == "prod-web-01" else \
@@ -343,6 +362,7 @@ class DemoClient:
                                 group=group, meta=((("working_dir", f"/opt/{group}"),
                                                     ("config_files", f"/opt/{group}/compose.yaml"),
                                                     ("compose_service", service)) if group else ())
+                                + ((("depends_on", _DEPENDS[service]),) if service in _DEPENDS else ())
                                 + ((("ports", _DEMO_PORTS[name]),) if name in _DEMO_PORTS else ()))
                     for name, (state, status, image, group, service) in self._docker.items())
             else:
@@ -504,6 +524,9 @@ class DemoClient:
 
     def console_command(self, service: ServiceInfo) -> str:
         return engines.build_console_command(service, False)
+
+    def change_backend(self) -> DemoChangeBackend:
+        return DemoChangeBackend(self)
 
     def list_pods(self) -> RuntimeResult:
         kind = ServiceKind.KUBERNETES
@@ -910,3 +933,136 @@ def seed_demo_history(store: HistoryStore, config: Config, hours: float = 24.0, 
             store.record(server.name, t, metrics, failed=1 if rng.random() < 0.05 else 0, active=40,
                          latency=max(0.5, latency * (1 + 0.15 * day) + rng.gauss(0, latency * 0.08)))
             t += step
+
+
+# ---------------------------------------------------------------------------
+# Mudanças seguras simuladas (inspect, tarefas demoradas, backups)
+# ---------------------------------------------------------------------------
+
+class DemoChangeBackend:
+    """Simula o motor para o fluxo de mudanças seguras no modo demonstração."""
+
+    _DURATIONS = {"stop": 2.5, "restart": 3.0, "commit": 2.0, "pull": 3.5, "run": 3.0}
+
+    def __init__(self, client: DemoClient) -> None:
+        self.client = client
+
+    def _table(self, engine: str) -> dict:
+        return {"docker": self.client._docker, "podman": self.client._podman,
+                "nerdctl": self.client._nerdctl}.get(engine, {})
+
+    def executable(self, engine: str) -> str:
+        return engine
+
+    def inspect(self, engine: str, name: str) -> dict | None:
+        with self.client._lock:
+            row = self._table(engine).get(name)
+            if row is None:
+                return None
+            state, status, image = row[0], row[1], row[2]
+            group = row[3] if len(row) > 3 else ""
+            service = row[4] if len(row) > 4 else ""
+        ports = {}
+        for host_port, container_port in engines.published_ports(_DEMO_PORTS.get(name, "")):
+            ports[f"{container_port}/tcp"] = [{"HostIp": "", "HostPort": str(host_port)}]
+        labels = {"com.docker.compose.project": group, "com.docker.compose.service": service,
+                  "com.docker.compose.project.working_dir": f"/opt/{group}"} if group and engine == "docker" else {}
+        if service in _DEPENDS:
+            labels["com.docker.compose.depends_on"] = _DEPENDS[service]
+        code = 0
+        if "(" in status:
+            inner = status.split("(", 1)[1].split(")", 1)[0]
+            code = int(inner) if inner.lstrip("-").isdigit() else 0
+        network = f"{group}_default" if group else "bridge"
+        return {
+            "Id": f"{abs(hash(name)):064x}"[:64], "Name": f"/{name}", "RestartCount": 0,
+            "State": {"Status": state, "Running": state == "running", "ExitCode": code},
+            "Config": {"Image": image, "Env": ["PATH=/usr/local/bin:/usr/bin", "TZ=America/Sao_Paulo",
+                                                "APP_SECRET_KEY=demo-segredo"],
+                       "Cmd": None, "Labels": labels, "Hostname": name[:12]},
+            "HostConfig": {"PortBindings": ports, "RestartPolicy": {"Name": "unless-stopped"},
+                           "NetworkMode": network},
+            "Mounts": [{"Type": "volume", "Name": v, "Destination": "/data", "RW": True}
+                       for v in _DEMO_VOLUMES.get(name, ())],
+            "NetworkSettings": {"Networks": {network: {}}},
+            "SizeRw": 23 * MIB if name == "backup-job" else 0,
+        }
+
+    def image_config(self, engine: str, image: str) -> dict | None:
+        with self.client._lock:
+            known = {row[2] for table in (self.client._docker, self.client._podman, self.client._nerdctl)
+                     for row in table.values()} | self.client._demo_images
+        return {"Env": ["PATH=/usr/local/bin:/usr/bin"]} if image in known else None
+
+    def _apply(self, engine: str, args: list[str]):
+        from core.change_runner import ShellResult
+
+        op, name = args[0], args[-1]
+        table = self._table(engine)
+        needs_container = op in ("stop", "start", "restart", "pause", "unpause", "rm")
+        with self.client._lock:
+            if needs_container and name not in table:
+                return ShellResult(False, f"Error: No such container: {name}")
+            if op == "stop":
+                table[name][:2] = ["exited", "Exited (0) 1 second ago"]
+            elif op in ("start", "restart", "unpause"):
+                table[name][:2] = ["running", "Up 1 second"]
+            elif op == "pause":
+                table[name][:2] = ["paused", "Up 3 days (Paused)"]
+            elif op == "rm":
+                if table[name][0] == "running":
+                    return ShellResult(False, "Error: cannot remove a running container")
+                del table[name]
+            elif op in ("commit", "pull"):
+                self.client._demo_images.add(name)
+            elif op == "run" and "--rm" in args:
+                return ShellResult(True, "")
+            elif op == "run":
+                new = args[args.index("--name") + 1]
+                known = {row[2] for tbl in (self.client._docker, self.client._podman, self.client._nerdctl)
+                         for row in tbl.values()} | self.client._demo_images
+                image = next((a for a in args if a in known), args[-1])
+                row = ["running", "Up 1 second", image] + (["", ""] if engine == "docker" else [""])
+                table[new] = row
+                return ShellResult(True, f"{abs(hash(new)):064x}"[:64])
+        return ShellResult(True, name)
+
+    def exec(self, engine: str, args):
+        return self._apply(engine, list(args))
+
+    def start_job(self, job_id: str, command: str):
+        from core.change_runner import ShellResult
+
+        argv = shlex.split(command)
+        engine = argv[0] if argv[0] in ("docker", "podman", "nerdctl") else "docker"
+        args = argv[1:]
+        duration = 4.0 if "--rm" in args else self._DURATIONS.get(args[0] if args else "", 2.0)
+        self.client._demo_jobs[job_id] = [time.monotonic() + duration, engine, args, None]
+        return ShellResult(True, "started")
+
+    def poll_job(self, job_id: str):
+        from core.changes import JobState
+
+        job = self.client._demo_jobs.get(job_id)
+        if job is None:
+            return JobState(True, None, "", missing=True)
+        due, engine, args, result = job
+        if time.monotonic() < due:
+            return JobState(False, None, "")
+        if result is None:
+            job[3] = result = self._apply(engine, args)
+        return JobState(True, 0 if result.ok else 1, result.output)
+
+    def cleanup_job(self, job_id: str) -> None:
+        self.client._demo_jobs.pop(job_id, None)
+
+    def file_size(self, path: str) -> int | None:
+        return 48 * MIB + len(path) * 1024
+
+    def logs_tail(self, engine: str, name: str, lines: int = 20) -> str:
+        return f"2026-09-29T12:00:01Z {name} iniciado\n2026-09-29T12:00:02Z pronto para conexões"
+
+    def backup_target(self, engine: str):
+        from core.change_runner import BackupTarget
+
+        return BackupTarget(directory="/home/monitor/firawynix-backups", owner="1000:1000")

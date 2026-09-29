@@ -282,7 +282,9 @@ def _container_meta(labels: dict[str, str]) -> tuple[str, tuple[tuple[str, str],
     meta = []
     for key, name in (("com.docker.compose.project.working_dir", "working_dir"),
                       ("com.docker.compose.project.config_files", "config_files"),
-                      ("com.docker.compose.service", "compose_service")):
+                      ("com.docker.compose.service", "compose_service"),
+                      ("com.docker.compose.depends_on", "depends_on"),
+                      ("PODMAN_SYSTEMD_UNIT", "systemd_unit")):
         if labels.get(key):
             meta.append((name, labels[key]))
     return group, tuple(meta)

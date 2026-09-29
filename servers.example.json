@@ -1,5 +1,5 @@
 {
-  "_comment": "Copie para servers.json. Segredos NUNCA ficam aqui: use password_env/key_passphrase_env (variáveis de ambiente ou .env) ou password_credential/key_passphrase_credential (Gerenciador de Credenciais do Windows).",
+  "_comment": "Copie para servers.json (ou edite pelo painel: botão \"Conexões\"). Segredos NUNCA ficam aqui: use password_env/key_passphrase_env (variáveis de ambiente ou .env), password_credential/key_passphrase_credential (Gerenciador de Credenciais do Windows) ou password_prompt/key_passphrase_prompt (pedir ao conectar, só em memória).",
   "settings": {
     "poll_interval_seconds": 5,
     "detail_interval_seconds": 15,
@@ -52,11 +52,17 @@
   "servers": [
     {
       "name": "prod-web-01",
-      "host": "192.168.10.21",
-      "port": 22,
+      "host": "ssh.exemplo.com.br",
       "username": "monitor",
       "key_file": "~/.ssh/id_ed25519",
       "key_passphrase_env": "PROD_WEB_KEY_PASSPHRASE",
+      "auth": "key",
+      "connector": {
+        "type": "cloudflared",
+        "hostname": "ssh.exemplo.com.br",
+        "service_token_credential": true,
+        "_comment": "Cloudflare Tunnel: cloudflared access ssh. Sem token de serviço, use 'Entrar no Cloudflare Access' no painel (login no navegador, uma vez)."
+      },
       "use_sudo": true,
       "docker": "auto",
       "docker_sudo": true,
@@ -65,16 +71,43 @@
       "network_sudo": false,
       "security_sudo": true,
       "security_actions": true,
-      "endpoints": ["https://loja.exemplo.com.br/", "https://api.exemplo.com.br/health", "tls://mail.exemplo.com.br:993"],
+      "endpoints": [
+        "https://loja.exemplo.com.br/",
+        "https://api.exemplo.com.br/health",
+        "tls://mail.exemplo.com.br:993"
+      ],
       "bandwidth_quota_gb": 1000,
       "bandwidth_count": "tx",
-      "critical_services": ["nginx", "postgresql*", "redis-server", "docker:shop-*"],
-      "exclude_services": ["systemd-*", "getty@*", "user@*"]
+      "critical_services": [
+        "nginx",
+        "postgresql*",
+        "redis-server",
+        "docker:shop-*"
+      ],
+      "exclude_services": [
+        "systemd-*",
+        "getty@*",
+        "user@*"
+      ]
     },
     {
       "name": "k3s-edge",
       "host": "10.0.20.11",
       "username": "monitor",
+      "auth": "key+password",
+      "key_file": "~/.ssh/id_ed25519",
+      "password_prompt": true,
+      "connector": {
+        "type": "vpn",
+        "name": "WireGuard escritório",
+        "check": "10.0.20.1:22",
+        "up_command": [
+          "C:\\Program Files\\WireGuard\\wireguard.exe",
+          "/installtunnelservice",
+          "C:\\VPN\\escritorio.conf"
+        ],
+        "_comment": "Servidor com 2 fatores (AuthenticationMethods publickey,password). A VPN é testada antes; se não responder, o painel roda up_command (opcional)."
+      },
       "kubernetes": "on",
       "kubectl_command": "k3s kubectl",
       "kubectl_sudo": true,
@@ -84,24 +117,39 @@
       "cri": "auto",
       "cri_sudo": true,
       "podman": "off",
-      "critical_services": ["k3s", "k8s:prod/*"]
+      "critical_services": [
+        "k3s",
+        "k8s:prod/*"
+      ]
     },
     {
       "name": "hv-01",
       "host": "10.0.30.5",
       "username": "monitor",
+      "connector": {
+        "type": "jump",
+        "host": "bastion.exemplo.com.br",
+        "username": "ops",
+        "key_file": "~/.ssh/id_bastion",
+        "_comment": "Host de salto (como ssh -J): o painel entra no bastion e abre o túnel até o hv-01."
+      },
       "libvirt": "on",
       "libvirt_uri": "qemu:///system",
       "lxd": "auto",
       "smart_sudo": true,
       "process_actions": true,
-      "critical_services": ["libvirtd", "vm:*", "lxd:gitea"]
+      "critical_services": [
+        "libvirtd",
+        "vm:*",
+        "lxd:gitea"
+      ]
     },
     {
       "name": "staging",
       "host": "staging.example.com",
       "port": 2222,
       "username": "deploy",
+      "auth": "password",
       "password_credential": true,
       "host_key_policy": "strict",
       "_comment": "Migrou do Docker para o Podman: 'on' avisa se o Podman sumir; o painel continua igual.",
@@ -109,8 +157,26 @@
       "podman": "on",
       "buildah": "auto",
       "smart": "off",
-      "unit_types": ["service", "timer"],
+      "unit_types": [
+        "service",
+        "timer"
+      ],
       "poll_interval_seconds": 10
+    },
+    {
+      "name": "filial-01",
+      "host": "10.50.0.8",
+      "username": "monitor",
+      "auth": "agent",
+      "connector": {
+        "type": "socks5",
+        "host": "127.0.0.1",
+        "port": 1080,
+        "_comment": "Proxy SOCKS5 (ex.: 'ssh -D 1080' ou o proxy da empresa). Também há 'http' (CONNECT) e 'command' (ProxyCommand)."
+      },
+      "critical_services": [
+        "nginx"
+      ]
     }
   ]
 }

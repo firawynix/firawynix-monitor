@@ -38,7 +38,11 @@ from config.settings import AppSettings, Config, NotificationSettings, ServerCon
 from core import containers as engines
 from core import security as security_rules
 from core import winapi
+from core import changes
 from core.alerts import HostAlertPolicy
+from core.backups import BackupStore, ChangeRecord
+from core.change_runner import ChangeRequest, ChangeRunner, new_change_id
+from core.changes import Assessment, ChangeAction, ContainerSpec, InspectInfo
 from core.endpoints import check_endpoint, parse_endpoint
 from core.history import HistoryStore
 from core.models import (
@@ -149,6 +153,7 @@ class HostClient(Protocol):
     def inspect_volume(self, engine_id: str, name: str) -> str: ...
     def check_image_update(self, image: ContainerImage) -> ImageUpdate: ...
     def console_command(self, service: ServiceInfo) -> str: ...
+    def change_backend(self) -> Any: ...
     def service_action(self, service: ServiceInfo, action: ServiceAction) -> ActionResult: ...
     def stack_action(self, stack: Stack, action: ServiceAction) -> ActionResult: ...
     def kill_process(self, pid: int, force: bool) -> ActionResult: ...
@@ -417,6 +422,8 @@ class ServerMonitor:
         self._seen_ok: set[ServiceKind] = set()
         self._consecutive_timeouts = 0
         self.state = ConnectionState.STOPPED
+        #: Último snapshot emitido (base da análise de risco das mudanças).
+        self.last_snapshot: HostSnapshot | None = None
 
     # -- ciclo de vida -----------------------------------------------------
 
@@ -476,10 +483,10 @@ class ServerMonitor:
         self._wake.clear()
 
     def _set_state(self, state: ConnectionState, message: str = "", retry_in: float | None = None,
-                   attempt: int = 0) -> None:
+                   attempt: int = 0, needs: str = "", needs_target: str = "") -> None:
         self.state = state
         self._emit(ConnectionEvent(server=self.server.name, state=state, message=message,
-                                   retry_in=retry_in, attempt=attempt))
+                                   retry_in=retry_in, attempt=attempt, needs=needs, needs_target=needs_target))
 
     # -- loop principal ------------------------------------------------------
 
@@ -501,6 +508,7 @@ class ServerMonitor:
                 snapshot = self._build_snapshot([], [f"Erro inesperado na coleta: {exc}"], 0.0)
             if self._stop.is_set():
                 break
+            self.last_snapshot = snapshot
             self._emit(SnapshotEvent(server=self.server.name, snapshot=snapshot))
             self._sleep(self.interval - (time.monotonic() - started))
         self.state = ConnectionState.STOPPED
@@ -515,7 +523,8 @@ class ServerMonitor:
             delay = backoff.next_delay()
             log.warning("[%s] falha ao conectar (tentativa %d, nova em %.1fs): %s",
                         self.server.name, attempt, delay, exc)
-            self._set_state(ConnectionState.RECONNECTING, str(exc), retry_in=delay, attempt=attempt)
+            self._set_state(ConnectionState.RECONNECTING, str(exc), retry_in=delay, attempt=attempt,
+                            needs=getattr(exc, "needs", ""), needs_target=getattr(exc, "target", ""))
             self._sleep(delay)
             return False
         except Exception as exc:  # noqa: BLE001
@@ -927,16 +936,33 @@ _TASK_LABELS = {
 # Gerenciador (fachada usada pela UI)
 # ---------------------------------------------------------------------------
 
+@dataclasses.dataclass(frozen=True)
+class PreparedChange:
+    """Resultado da análise (mostrado ao usuário antes de confirmar)."""
+
+    assessment: Assessment
+    inspect: InspectInfo | None
+    spec: ContainerSpec | None
+    stop_timeout: int = 10
+    record: ChangeRecord | None = None
+    use_snapshot: bool = False
+
+
 class MonitorManager:
     def __init__(self, config: Config, client_factory: ClientFactory = default_client_factory,
-                 history: HistoryStore | None = None, max_workers: int = 4) -> None:
+                 history: HistoryStore | None = None, max_workers: int = 4,
+                 backups: BackupStore | None = None) -> None:
         self.config = config
         self.history = history
+        #: Backups locais e histórico das mudanças seguras (None = só em memória).
+        self.backups = backups or BackupStore(None)
         self.events: queue.Queue[MonitorEvent] = queue.Queue()
+        self._client_factory = client_factory
         self.monitors: dict[str, ServerMonitor] = {
             server.name: ServerMonitor(server, config.settings, self.events.put, client_factory, history)
             for server in config.servers
         }
+        self._started = False
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="ssh-action")
 
     @property
@@ -944,8 +970,37 @@ class MonitorManager:
         return list(self.monitors)
 
     def start(self) -> None:
+        self._started = True
         for monitor in self.monitors.values():
             monitor.start()
+
+    def apply_config(self, config: Config) -> dict[str, list[str]]:
+        """Aplica servidores novos/alterados/removidos sem reiniciar o app (diálogo de conexões).
+
+        Só recria o monitor do servidor cuja configuração mudou; os demais continuam como estão."""
+        changes: dict[str, list[str]] = {"added": [], "updated": [], "removed": []}
+        wanted = {server.name: server for server in config.servers}
+        for name in [n for n in self.monitors if n not in wanted]:
+            self.monitors.pop(name).stop(timeout=1.0)
+            changes["removed"].append(name)
+        rebuilt: dict[str, ServerMonitor] = {}
+        for name, server in wanted.items():
+            current = self.monitors.get(name)
+            if current is not None and current.server == server:
+                rebuilt[name] = current
+                continue
+            if current is not None:
+                current.stop(timeout=1.0)
+                changes["updated"].append(name)
+            else:
+                changes["added"].append(name)
+            monitor = ServerMonitor(server, config.settings, self.events.put, self._client_factory, self.history)
+            rebuilt[name] = monitor
+            if self._started:
+                monitor.start()
+        self.monitors = rebuilt
+        self.config = config
+        return changes
 
     def stop(self) -> None:
         for monitor in self.monitors.values():
@@ -1065,6 +1120,73 @@ class MonitorManager:
 
     def console_command(self, server: str, service: ServiceInfo) -> str:
         return self.monitors[server].client.console_command(service)
+
+    # -- mudanças seguras ------------------------------------------------------
+
+    def prepare_change(self, server: str, action: ChangeAction, service: ServiceInfo | None = None,
+                       spec: ContainerSpec | None = None, record: ChangeRecord | None = None,
+                       use_snapshot: bool = False) -> Future[PreparedChange]:
+        """Análise de risco com o estado real (inspect) — nada é alterado."""
+        monitor = self.monitors[server]
+
+        def task() -> PreparedChange:
+            if not monitor.client.connected:
+                raise SSHConnectionError(f"{server} está desconectado")
+            backend = monitor.client.change_backend()
+            ctx = changes.context_from_snapshot(monitor.last_snapshot, monitor.server)
+            engine = engines.ENGINE_OF_KIND.get(service.kind, "") if service is not None else (
+                spec.engine if spec is not None else record.engine if record is not None else "")
+            current_spec = spec
+            data = None
+            if service is not None:
+                data = backend.inspect(engine, service.name)
+            if action is ChangeAction.RESTORE and record is not None:
+                definition = self.backups.load_definition(record)
+                if definition is None:
+                    raise ValueError("a definição salva desta mudança não foi encontrada neste PC")
+                image = str((definition.get("Config") or {}).get("Image") or "")
+                image_config = backend.image_config(engine, image) if image else None
+                current_spec = changes.spec_from_inspect(definition, engine, image_config)
+                if use_snapshot and record.snapshot_image:
+                    current_spec = dataclasses.replace(current_spec, image=record.snapshot_image)
+            inspect_info = changes.parse_inspect(data) if data else None
+            assessment = changes.assess(action, service, ctx, inspect=inspect_info, spec=current_spec)
+            role = changes.container_role(inspect_info.image if inspect_info else
+                                          (current_spec.image if current_spec else ""))
+            return PreparedChange(assessment=assessment, inspect=inspect_info, spec=current_spec,
+                                  stop_timeout=30 if role == "banco" else 10, record=record,
+                                  use_snapshot=use_snapshot)
+
+        return self._executor.submit(task)
+
+    def run_change(self, server: str, prepared: PreparedChange, protections: Iterable[str],
+                   service: ServiceInfo | None = None) -> tuple[str, Future[ChangeRecord]]:
+        """Executa a mudança analisada; o andamento chega como ChangeProgressEvent."""
+        monitor = self.monitors[server]
+        assessment = prepared.assessment
+        if assessment.blockers:
+            raise ValueError("; ".join(assessment.blockers))
+        chosen = {p.id for p in assessment.protections if p.required} | set(protections)
+        spec = prepared.spec
+        name = service.name if service is not None else spec.name if spec is not None else assessment.target
+        request = ChangeRequest(
+            id=new_change_id(assessment.action), server=server, action=assessment.action, engine=assessment.engine,
+            name=name, risk=assessment.risk, service=service, spec=spec, protections=frozenset(chosen),
+            stop_timeout=prepared.stop_timeout, source_record=prepared.record, use_snapshot=prepared.use_snapshot,
+            steps=changes.plan_steps(assessment.action, assessment.protections, service, chosen))
+
+        def task() -> ChangeRecord:
+            runner = ChangeRunner(monitor.client.change_backend(), self.backups, self.events.put, request,
+                                  expect_stop=monitor.policy.expect_stop)
+            try:
+                return runner.run()
+            finally:
+                monitor.refresh_now(full=True)
+
+        return request.id, self._executor.submit(task)
+
+    def change_records(self, server: str | None = None) -> list[ChangeRecord]:
+        return self.backups.records(server)
 
     def fail2ban_action(self, server: str, jail: str, ip: str, ban: bool) -> Future[ActionResult]:
         label = "Banir" if ban else "Desbanir"

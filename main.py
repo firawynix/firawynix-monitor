@@ -208,7 +208,11 @@ def main(argv: list[str] | None = None) -> int:
         seed_demo_history(history, app_config)
 
     notifier = Notifier(settings.notifications, icon_path=icon_png)
-    manager = MonitorManager(app_config, client_factory=client_factory, history=history)
+    from core.backups import BackupStore
+
+    # Backups das mudanças e histórico: neste PC (%LOCALAPPDATA%); no modo demonstração, só em memória.
+    backups = BackupStore(None if args.demo else user_data_dir() / "backups")
+    manager = MonitorManager(app_config, client_factory=client_factory, history=history, backups=backups)
     tray: TrayIcon | None = None
 
     def shutdown() -> None:

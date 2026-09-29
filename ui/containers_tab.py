@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 import customtkinter as ctk
 
 from core import containers as engines
+from core.changes import ChangeAction
 from core.models import (
     ContainerImage,
     ContainerInventory,
@@ -32,6 +33,7 @@ from core.models import (
     ServiceStatus,
 )
 from ui import theme
+from ui.change_dialog import open_folder
 from ui.tabs import Tab, _button, _matches, _search_entry, _set_state
 from ui.widgets import (
     CARD_BG,
@@ -52,7 +54,12 @@ from ui.widgets import (
 if TYPE_CHECKING:
     from ui.dashboard import Dashboard
 
-VIEWS = ("Contêineres", "Imagens", "Volumes", "Redes", "Builds", "Disco")
+VIEWS = ("Contêineres", "Imagens", "Volumes", "Redes", "Builds", "Disco", "Mudanças")
+_OUTCOME_STATUS = {"ok": ServiceStatus.ACTIVE, "warning": ServiceStatus.DEGRADED, "error": ServiceStatus.FAILED,
+                   "running": ServiceStatus.ACTIVATING}
+_OUTCOME_TEXT = {"ok": "Concluída", "warning": "Com avisos", "error": "Falhou", "running": "Em andamento"}
+_ACTION_TEXT = {"start": "Iniciar", "stop": "Parar", "restart": "Reiniciar", "pause": "Pausar", "unpause": "Retomar",
+                "remove": "Remover", "create": "Criar", "restore": "Restaurar"}
 ALL_ENGINES = "Todos os motores"
 _CHIPS_PER_ROW = 3
 _SELECTION_MAX = 90
@@ -324,7 +331,8 @@ class ContainersTab(Tab):
         for column, view in enumerate(VIEWS):
             row.grid_columnconfigure(column, weight=1, uniform="tile")
             tile = _Tile(row, view, lambda v=view: self._switch(v))
-            tile.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 4, 0 if column == 5 else 4))
+            last = column == len(VIEWS) - 1
+            tile.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 4, 0 if last else 4))
             self.tiles[view] = tile
 
     def _build_toolbar(self) -> None:
@@ -345,6 +353,8 @@ class ContainersTab(Tab):
         self.btn_updates = _button(toolbar, "Verificar atualizações (skopeo)", self._check_all_updates, "neutral",
                                    230)
         self.btn_updates.grid(row=0, column=4)
+        self.btn_new = _button(toolbar, "+ Novo contêiner", self._new_container, width=150)
+        self.btn_new.grid(row=0, column=5, padx=(8, 0))
 
     def _build_tables(self) -> None:
         content = ctk.CTkFrame(self, fg_color="transparent")
@@ -391,6 +401,13 @@ class ContainersTab(Tab):
                  Column("active", "Ativos", 80, anchor="e"), Column("size", "Tamanho", 120, anchor="e"),
                  Column("reclaimable", "Recuperável", 150, anchor="e"), Column("pad", "", 10, True)],
                 export_name="uso-de-disco"),
+            "Mudanças": DataTable(
+                content,
+                [Column("time", "Quando", 130), Column("target", "Contêiner", 170), Column("action", "Ação", 90),
+                 Column("risk", "Risco", 70), Column("saved", "O que foi salvo", 300, True),
+                 Column("detail", "Resultado", 320, True)],
+                tree_column=Column("outcome", "Situação", 130), sort_column="time", sort_desc=True,
+                on_select=self._update_actions, on_activate=self._show_definition, export_name="mudancas"),
         }
         for table in self.tables.values():
             table.grid(row=0, column=0, sticky="nsew")
@@ -414,6 +431,11 @@ class ContainersTab(Tab):
             "remove": _button(bar, "Remover", self._remove, "stop", 90),
             "prune": _button(bar, "Limpar órfãs", self._prune, "stop", 112),
             "copy": _button(bar, "Copiar nome", self._copy_name, "neutral", 110),
+            "restore": _button(bar, "Restaurar", lambda: self._restore(False), width=100),
+            "restore_snapshot": _button(bar, "Restaurar do snapshot", lambda: self._restore(True), width=170),
+            "start_again": _button(bar, "Iniciar de novo", self._start_again, "start", 130),
+            "definition": _button(bar, "Ver definição", self._show_definition, "neutral", 120),
+            "folder": _button(bar, "Abrir pasta", self._open_folder, "neutral", 110),
         }
         self._view_buttons = {
             "Contêineres": ("start", "stop", "restart", "pause", "logs", "console", "inspect", "remove"),
@@ -422,6 +444,7 @@ class ContainersTab(Tab):
             "Redes": ("copy",),
             "Builds": ("copy",),
             "Disco": (),
+            "Mudanças": ("start_again", "restore", "restore_snapshot", "definition", "folder"),
         }
 
     # -- troca de visão ------------------------------------------------------------
@@ -445,6 +468,10 @@ class ContainersTab(Tab):
             self.btn_updates.grid()
         else:
             self.btn_updates.grid_remove()
+        if view == "Contêineres":
+            self.btn_new.grid()
+        else:
+            self.btn_new.grid_remove()
         if render:
             self.app.render_current_tab()
 
@@ -475,6 +502,7 @@ class ContainersTab(Tab):
         self._render_networks(networks, waiting)
         self._render_builds(builds, inventory, waiting)
         self._render_disk(disk, waiting)
+        self._render_changes(containers)
         self._update_actions()
 
     def _waiting_message(self, snapshot: HostSnapshot | None, inventory: ContainerInventory | None) -> str | None:
@@ -722,6 +750,70 @@ class ContainersTab(Tab):
         if self._view == "Disco":
             self.info.configure(text="Espaço usado por imagens, contêineres, volumes e cache de build")
 
+    def _render_changes(self, containers: list[ServiceInfo]) -> None:
+        records = self.app.manager.change_records(self._server) if self._server else []
+        self._records = {r.id: r for r in records}
+        present = {s.name: s for s in containers}
+        self._present = present
+        rows = []
+        for record in records:
+            if not _matches(self.search, record.target, record.action, record.message):
+                continue
+            saved = []
+            if record.definition_dir:
+                saved.append("definição")
+            if record.snapshot_image:
+                saved.append(f"snapshot {record.snapshot_image.rsplit(':', 1)[-1]}")
+            if record.volume_backups:
+                saved.append(plural(len(record.volume_backups), "volume", "volumes"))
+            when = dt.datetime.fromtimestamp(record.time).strftime("%d/%m %H:%M:%S")
+            rows.append(Row(
+                key=record.id, text=_OUTCOME_TEXT.get(record.outcome, record.outcome),
+                status=_OUTCOME_STATUS.get(record.outcome, ServiceStatus.UNKNOWN),
+                values=(when, record.target, _ACTION_TEXT.get(record.action, record.action), record.risk,
+                        ", ".join(saved) or "—", record.message),
+                sort=((_OUTCOME_STATUS.get(record.outcome, ServiceStatus.UNKNOWN).severity, record.time),
+                      record.time, record.target, record.action, record.risk, ", ".join(saved), record.message)))
+        local = "neste PC" if self.app.manager.backups.root is not None else "nesta sessão (demonstração)"
+        self.tables["Mudanças"].set_rows(rows, f"Nenhuma mudança registrada {local} para este servidor.")
+        last = records[0] if records else None
+        self.tiles["Mudanças"].set(str(len(records)),
+                                   f"última: {_ACTION_TEXT.get(last.action, last.action).lower()} {last.target}"
+                                   if last else "histórico e restauração",
+                                   RED if last and last.outcome == "error" else None)
+        if self._view == "Mudanças":
+            self.info.configure(text=f"{len(rows)} mudança(s) · backups das definições {local}")
+
+    def _selected_record(self):
+        key = self.tables["Mudanças"].selected_key()
+        return getattr(self, "_records", {}).get(key) if key else None
+
+    def _restore(self, snapshot: bool) -> None:
+        record = self._selected_record()
+        if record is not None and self._server:
+            self.app.open_change(self._server, ChangeAction.RESTORE, record=record, use_snapshot=snapshot)
+
+    def _start_again(self) -> None:
+        record = self._selected_record()
+        service = getattr(self, "_present", {}).get(record.target) if record else None
+        if service is not None and self._server:
+            self.app.open_change(self._server, ChangeAction.START, service=service)
+
+    def _show_definition(self) -> None:
+        record = self._selected_record()
+        if record is not None:
+            self.app.show_text(f"Definição salva — {record.target}",
+                               text=self.app.manager.backups.readable_definition(record))
+
+    def _open_folder(self) -> None:
+        record = self._selected_record()
+        if record is not None and record.definition_dir and not record.definition_dir.startswith("memória://"):
+            open_folder(record.definition_dir)
+
+    def _new_container(self) -> None:
+        if self._server:
+            self.app.open_new_container(self._server)
+
     # -- seleção e ações ---------------------------------------------------------------
 
     def _selected_service(self) -> ServiceInfo | None:
@@ -760,7 +852,8 @@ class ContainersTab(Tab):
             "logs": self._connected(),
             "console": manageable and running and not paused,
             "inspect": self._connected(),
-            "remove": manageable and bool(config and config.container_admin) and not running and not paused,
+            # Em execução também: a mudança segura para (com backup) antes de remover.
+            "remove": manageable and bool(config and config.container_admin),
         }
 
     def _update_actions(self) -> None:
@@ -833,6 +926,29 @@ class ContainersTab(Tab):
             key = self.tables[self._view].selected_key()
             _set_state(self.buttons["copy"], key is not None)
             text = self._names.get(key, "") if key else f"Selecione um item em {self._view}."
+        elif self._view == "Mudanças":
+            record = self._selected_record()
+            if record is None:
+                text = "Selecione uma mudança: dá para iniciar de novo, restaurar e ver o que foi salvo."
+            else:
+                present = getattr(self, "_present", {})
+                service = present.get(record.target)
+                connected = self._connected()
+                can_restore = (connected and admin and record.definition_dir and record.target not in present
+                               and record.action in ("remove", "stop", "restart", "pause"))
+                _set_state(self.buttons["restore"], bool(can_restore))
+                _set_state(self.buttons["restore_snapshot"], bool(can_restore and record.snapshot_image))
+                _set_state(self.buttons["start_again"], bool(connected and service is not None
+                                                             and service.status is not ServiceStatus.ACTIVE
+                                                             and service.kind.manageable))
+                _set_state(self.buttons["definition"], bool(record.definition_dir))
+                _set_state(self.buttons["folder"], bool(record.definition_dir)
+                           and not record.definition_dir.startswith("memória://"))
+                text = f"{_ACTION_TEXT.get(record.action, record.action)} {record.target} · risco {record.risk}"
+                if record.target not in present and record.definition_dir:
+                    text += "  ·  não existe mais: pode ser restaurado"
+                if record.compose_hint:
+                    text += "  ·  Compose: " + record.compose_hint
         else:
             text = "Para liberar espaço: \"Limpar órfãs\" na visão Imagens (somente imagens sem tag)."
         self.selection.configure(text=_truncate(text), text_color=color)

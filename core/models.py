@@ -964,6 +964,27 @@ class ConnectionEvent(MonitorEvent):
     message: str = ""
     retry_in: float | None = None
     attempt: int = 0
+    #: Ação do usuário necessária: "password", "passphrase" ou "cloudflare-login".
+    needs: str = ""
+    #: Servidor (ou host de salto) a que o segredo pertence.
+    needs_target: str = ""
+
+
+@dataclass(frozen=True, kw_only=True)
+class ChangeProgressEvent(MonitorEvent):
+    """Andamento de uma mudança segura (um evento por passo)."""
+
+    change_id: str
+    #: Rótulos de todos os passos (enviados no primeiro evento).
+    steps: tuple[str, ...] = ()
+    index: int = -1
+    #: pending | running | ok | warning | error | skipped
+    status: str = ""
+    message: str = ""
+    finished: bool = False
+    #: ok | warning | error (quando finished)
+    outcome: str = ""
+    record_id: str = ""
 
 
 @dataclass(frozen=True, kw_only=True)

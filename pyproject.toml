@@ -1,6 +1,6 @@
 [project]
 name = "firawynix-monitor"
-version = "3.1.0"
+version = "3.2.0"
 description = "Monitor desktop (Windows) de servidores Linux e VPS via SSH: systemd, Docker/Podman, LXD, Compose, Kubernetes, VMs, segurança, SMART, endpoints e histórico."
 readme = "README.md"
 requires-python = ">=3.11"

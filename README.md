@@ -9,9 +9,14 @@ pods **Kubernetes** (inclusive k3s/microk8s), **VMs libvirt/KVM**, processos, po
 agendamentos, eventos do journal, **auditoria de segurança** (SSH, firewall, fail2ban,
 logins, sudo), **saúde dos discos (SMART)**, **sites e certificados TLS**, franquia de
 tráfego e a saúde do host, com **histórico em gráficos**. Não instala nenhum agente nos
-servidores: tudo acontece por **SSH** (Paramiko). Integra-se à **API do Windows**
-(Gerenciador de Credenciais, Visualizador de Eventos, barra de tarefas, inicialização,
-energia e ICMP).
+servidores: tudo acontece por **SSH** (Paramiko), a partir do seu PC — direto, por **VPN**,
+pelo **Cloudflare Tunnel** (`cloudflared`), por **host de salto** ou **proxy** — com chave
+SSH, chave + passphrase, usuário e senha, **chave + senha (2 fatores)** ou agente. Toda
+mudança em contêiner (parar, iniciar, reiniciar, remover, **criar**, restaurar) segue um
+**caminho seguro**: analisa o risco e o que pode ser afetado **antes**, salva o que for
+preciso, executa, confirma o resultado e deixa o caminho de volta no histórico.
+Integra-se à **API do Windows** (Gerenciador de Credenciais, DPAPI, Visualizador de
+Eventos, barra de tarefas, inicialização, energia e ICMP).
 
 ![Painel de um servidor (modo demonstração)](docs/screenshot.png)
 
@@ -21,6 +26,8 @@ energia e ICMP).
 |---|---|
 | **Visão geral** | Todos os servidores lado a lado (saúde, CPU, memória, disco, load, rede, **latência**, uptime, cargas ativas/falhas, contêineres/pods/VMs, **nota de segurança**, alertas) e uma lista única de **problemas em todos os servidores** (cargas, endpoints fora do ar, discos com SMART ruim, falhas críticas de segurança); duplo clique leva ao item |
 | **Contêineres** | Painel próprio e **idêntico para qualquer motor** (Docker, Podman, containerd/nerdctl, CRI-O/containerd via crictl, Buildah, Skopeo): **auto-detecção** dos motores instalados (versão, rootless, estado do daemon) ou escolha manual no botão **Motores…**; contêineres com imagem, portas, stack/pod, CPU e memória; **imagens** (tamanho, uso, órfãs) com **verificação de atualizações no registro via Skopeo** (sem baixar nada); **volumes** (em uso ou não), **redes** (sub-redes, contêineres), **builds do Buildah** e **uso de disco** (`system df`). Ações: iniciar/parar/reiniciar, **pausar/retomar**, logs, **console** (shell no contêiner via `ssh -t`), inspecionar e — com `container_admin` — remover contêineres parados, imagens, volumes e **limpar imagens órfãs**. Painéis web de terceiros (**Portainer**, Cockpit, Dockge, Yacht, Dozzle, Rancher, Watchtower) são **detectados** e abertos no navegador, sem mudar o layout |
+| **Mudanças seguras** | Parar, iniciar, reiniciar, pausar, remover, **criar** e **restaurar** qualquer contêiner com o mesmo fluxo: **análise de risco** (nenhum → crítico) e **o que pode ser afetado** antes de executar — portas e sites que saem do ar, contêineres que dependem dele (Compose `depends_on`), papel (banco, proxy, túnel/VPN de acesso, painel), dados gravados dentro do contêiner, política de reinício, conflitos de porta e de nome, memória/disco, riscos de segurança de um contêiner novo (privileged, `docker.sock`, rede do host). **Proteções**: definição salva neste PC (criptografada com DPAPI), **snapshot** (`commit`) e **backup dos volumes com o contêiner parado**; depois, parada graciosa, verificação (parou? subiu e ficou estável? entrou em loop?) e registro no **histórico de mudanças** com *Iniciar novamente* e *Restaurar*. Contêiner que derrubaria a conexão do próprio painel (túnel/VPN) é **crítico** e exige digitar o nome |
+| **Conexões** | Botão **Conexões**: adicionar, editar e remover servidores sem abrir o JSON — autenticação (chave, chave + passphrase, usuário e senha, **chave + senha (2FA)**, agente) e **conector** (direto, **VPN**, **Cloudflare Tunnel**, **host de salto**, **proxy SOCKS5/HTTP**, comando). **Testar conexão** conecta de verdade; **Salvar e aplicar** valida tudo, guarda o `.bak` e aplica **sem reiniciar**. Senhas: Gerenciador de Credenciais ou **pedir ao conectar** (só em memória) |
 | **Serviços** | Unidades systemd (`service`, `timer`, `socket`, `mount`, `path`), contêineres de todos os motores, **instâncias LXD/Incus** (contêineres e VMs), pods Kubernetes e VMs libvirt em uma só tabela, com CPU/memória por serviço (cgroup v2), por contêiner (`stats`) e por instância LXD; filtros por status e tipo, busca e ordenação |
 | **Stacks** | Projetos do Docker/Podman **Compose**, pods do Podman e namespaces do Kubernetes, com status agregado (ativo/degradado/falha), membros, diretório/arquivos do Compose e ações na stack inteira |
 | **Processos** | Top N por CPU (CPU instantânea via `/proc`), memória, RSS, tempo, linha de comando; encerrar com TERM/KILL (desativado por padrão) |
@@ -48,6 +55,10 @@ energia e ICMP).
 | Histórico | Sistema (SMART) | Tema claro |
 |---|---|---|
 | ![Histórico](docs/screenshot-historico.png) | ![Sistema](docs/screenshot-sistema.png) | ![Tema claro](docs/screenshot-claro.png) |
+
+| Mudança segura: risco, impacto e proteções | Histórico de mudanças (iniciar/restaurar) | Servidores e conexões |
+|---|---|---|
+| ![Mudança segura](docs/screenshot-mudanca.png) | ![Histórico de mudanças](docs/screenshot-historico-mudancas.png) | ![Conexões](docs/screenshot-conexoes.png) |
 
 ## Arquitetura
 
@@ -251,9 +262,12 @@ na interface fica em `%APPDATA%\FirawynixMonitor\preferences.json` e tem priorid
 | `name` | — | Nome exibido (único) |
 | `host` / `port` | — / `22` | Endereço SSH |
 | `username` | — | Usuário SSH (recomendado: usuário dedicado, ex. `monitor`) |
+| `auth` | `"auto"` | Modo de autenticação: `auto`, `key`, `password`, `key+password` (2 fatores) ou `agent` — veja [Conectores e autenticação](#conectores-e-autenticação) |
 | `key_file` | — | Chave privada (`~` e `%VAR%` são expandidos). Sem ela, usa o agente SSH e as chaves padrão de `~/.ssh` |
 | `key_passphrase_env` / `password_env` | — | **Nome** da variável de ambiente com a passphrase / senha |
 | `key_passphrase_credential` / `password_credential` | — | `true` (nome padrão `FirawynixMonitor/<servidor>` ou `…/<servidor>/passphrase`) ou o nome de uma credencial genérica do **Gerenciador de Credenciais do Windows** |
+| `key_passphrase_prompt` / `password_prompt` | `false` | **Pedir ao conectar**: o painel pergunta e guarda só na memória até fechar |
+| `connector` | direto | Caminho até o servidor: `vpn`, `cloudflared`, `jump`, `socks5`, `http` ou `command` (objeto com os campos do tipo; veja abaixo) |
 | `allow_agent` / `look_for_keys` | `true` | Usa o agente (OpenSSH do Windows / Pageant) e as chaves padrão |
 | `host_key_policy` | `"accept-new"` | `accept-new` (TOFU, como o OpenSSH) ou `strict`. Chave **diferente** da gravada é sempre recusada |
 | `unit_types` | todos | Tipos de unidade systemd coletados: `service`, `timer`, `socket`, `mount`, `path` |
@@ -264,7 +278,7 @@ na interface fica em `%APPDATA%\FirawynixMonitor\preferences.json` e tem priorid
 | `cri` / `cri_sudo` | `"auto"` / `false` | Contêineres do Kubernetes direto no runtime CRI (CRI-O/containerd) via `crictl` — somente leitura; costuma exigir root |
 | `buildah` / `buildah_sudo` | `"auto"` / `false` | Builds em andamento (contêineres de trabalho) e imagens do Buildah |
 | `skopeo` | `"auto"` | Verificação de atualizações de imagens direto no registro (sem baixar) |
-| `container_admin` | `false` | Permite **remover** contêineres parados, imagens, volumes e limpar imagens órfãs pela interface |
+| `container_admin` | `false` | Permite **remover** contêineres (o fluxo seguro para antes, com snapshot), imagens, volumes, limpar imagens órfãs, **criar** contêineres novos e **restaurar** contêineres removidos |
 | `lxd` / `lxd_sudo` | `"auto"` / `false` | Instâncias LXD/Incus (`incus` ou `lxc`, inclusive snap) |
 | `kubernetes` | `"auto"` | Pods via `kubectl` |
 | `kubectl_command` | `"kubectl"` | Ex.: `"k3s kubectl"`, `"microk8s kubectl"` ou caminho absoluto |
@@ -297,6 +311,39 @@ Senhas e passphrases **nunca** ficam no `servers.json` — chaves como `password
    arquivo ou log.
 2. **Variável de ambiente**: `"password_env": "NOME"` e o valor nas variáveis do Windows
    ou em um `.env` ao lado do `servers.json`/executável (veja [`.env.example`](.env.example)).
+
+## Conectores e autenticação
+
+O painel roda **no seu PC** e chega ao servidor pelo caminho escolhido em `connector`
+(ou no botão **Conexões**). O SSH é sempre ponta a ponta: o conector só transporta os
+bytes, e a chave do host continua sendo verificada.
+
+| `connector.type` | Campos | Como funciona |
+|---|---|---|
+| (omitido) / `direct` | — | Conexão TCP direta ao `host:port` |
+| `vpn` | `name`, `check` (`host:porta`, padrão = o próprio servidor), `up_command` (opcional, lista de argumentos) | Testa se a rota da VPN responde antes de conectar. Se não responder e houver `up_command` (ex.: `wireguard.exe /installtunnelservice …`, `tailscale up`, `rasdial …`), roda **uma vez** (no máximo a cada 2 min) e espera a rota subir até 20 s. Sem comando, explica que a VPN precisa ser ligada |
+| `cloudflared` | `hostname` (padrão = `host`), `destination`, `cloudflared_path`, `service_token_credential` **ou** `service_token_id_env` + `service_token_secret_env` | Túnel pelo **Cloudflare Access** com `cloudflared access ssh --hostname …` (como o `ProxyCommand` do OpenSSH, mas sem janela de console). Com **token de serviço** (Client ID/Secret no Gerenciador de Credenciais ou em variáveis), nada é pedido; sem token, use **Entrar no Cloudflare Access** (login no navegador uma vez; o painel **não** abre o navegador sozinho a cada reconexão) |
+| `jump` | `host`, `port`, `username`, `auth`, `key_file`, `password_*`, `key_passphrase_*` | Host de salto (bastion), como `ssh -J`: o painel autentica no bastion e abre um canal `direct-tcpip` até o servidor. O bastion tem autenticação própria (credencial `FirawynixMonitor/<servidor>/jump`) |
+| `socks5` | `host`, `port` (1080), `username`, `password_env`/`password_credential` | Proxy SOCKS5 (RFC 1928/1929); o nome do servidor é resolvido pelo proxy |
+| `http` | `host`, `port` (3128), `username`, `password_env`/`password_credential` | Proxy HTTP `CONNECT` (autenticação Basic) |
+| `command` | `command` (lista de argumentos; `%h` host, `%p` porta, `%r` usuário) | Qualquer `ProxyCommand` que fale pelo stdin/stdout (ex.: `ncat --proxy …`, `ssh -W %h:%p bastion`) |
+
+**Autenticação** (`auth`), todas com as mesmas fontes de segredo (Gerenciador de
+Credenciais, variável de ambiente ou pedir ao conectar):
+
+| `auth` | Usa | Quando |
+|---|---|---|
+| `auto` (padrão) | chave (arquivo, `~/.ssh`, agente) e, se houver, a senha | Compatível com as versões anteriores |
+| `key` | chave privada (com passphrase, se tiver) | O recomendado |
+| `password` | usuário e senha (também responde ao *keyboard-interactive*) | Servidores sem chave |
+| `key+password` | chave **e depois** senha | sshd com `AuthenticationMethods publickey,password` (2 fatores) |
+| `agent` | só o agente SSH (OpenSSH do Windows / Pageant) | Chaves que nunca saem do agente |
+
+Quando algo falta — senha "pedir ao conectar", passphrase ou login no Cloudflare —, o
+painel **pergunta uma vez** (ou avisa pela bandeja, se estiver minimizado) em vez de
+tentar de novo sem parar. Erros de autenticação dizem o que o servidor aceita (ex.: "o
+servidor também exige senha (2 fatores): use Chave SSH + senha"). O **Terminal SSH** segue
+o mesmo conector (`-J` para salto e `ProxyCommand` para Cloudflare/comando).
 
 ## Preparando os servidores Linux
 
@@ -339,7 +386,22 @@ Senhas e passphrases **nunca** ficam no `servers.json` — chaves como `password
    ```
 
    Ações usam `--no-block` (systemd) e `-t 3` (contêineres) para caber no limite de 5 s;
-   o que demorar mais aparece como **Iniciando** na coleta seguinte.
+   o que demorar mais aparece como **Iniciando** na coleta seguinte. As **mudanças
+   seguras** rodam passos longos (parada graciosa, snapshot, backup) em segundo plano no
+   servidor e acompanham com comandos curtos, sem estourar o limite.
+
+   **Backup dos volumes com `docker_sudo`/`podman_sudo`**: instale o script
+   [`docs/firawynix-volume-backup`](docs/firawynix-volume-backup) e libere só ele no
+   sudoers (em vez de um `docker run` genérico, que equivale a root):
+
+   ```bash
+   sudo install -o root -g root -m 0755 firawynix-volume-backup /usr/local/sbin/firawynix-volume-backup
+   echo 'monitor ALL=(root) NOPASSWD: /usr/local/sbin/firawynix-volume-backup' | sudo tee /etc/sudoers.d/firawynix-backup
+   sudo chmod 0440 /etc/sudoers.d/firawynix-backup && sudo visudo -c
+   ```
+
+   Os backups ficam em `/var/backups/firawynix` (0750, grupo do usuário do monitor).
+   Sem sudo (grupo `docker` ou Podman rootless), ficam em `~/firawynix-backups`.
 
 4. **CPU/memória por serviço** exigem cgroup v2 (Ubuntu 22.04+, Debian 11+, RHEL 9+);
    em cgroup v1 essas colunas ficam vazias e o resto funciona normalmente.
@@ -365,12 +427,18 @@ Senhas e passphrases **nunca** ficam no `servers.json` — chaves como `password
   contêiner, ex.: `docker compose up -d`). **Console** abre um shell no contêiner no
   Windows Terminal (`ssh -t … exec -it`). **Motores…** escolhe entre auto-detecção e
   seleção manual (veja abaixo).
+* **Mudanças em contêineres**: *Iniciar/Parar/Reiniciar/Pausar/Remover* e **+ Novo
+  contêiner** abrem o diálogo de mudança (veja [Mudanças seguras](#mudanças-seguras-em-contêineres)).
+  A visão **Mudanças** (aba Contêineres) lista o histórico com *Iniciar novamente*,
+  *Restaurar*, *Restaurar do snapshot*, *Ver definição* e *Abrir pasta*.
+* **Conexões**: adiciona/edita servidores, autenticação e conector; *Testar conexão* e
+  *Salvar e aplicar* (sem reiniciar o painel).
 * **Stacks**: selecione uma stack para ver os membros; as ações valem para todos os
   contêineres dela. Namespaces do Kubernetes são somente leitura aqui.
 * **Pods**: *Reiniciar* exclui o pod para o controlador recriá-lo. Iniciar/Parar não se aplicam.
 * **VMs**: *Parar* envia desligamento ACPI (`virsh shutdown`), nunca `destroy`.
-* **Terminal SSH**: abre `ssh usuario@host` (com a chave configurada) no Windows
-  Terminal ou em um console novo.
+* **Terminal SSH**: abre `ssh usuario@host` (com a chave e o conector configurados) no
+  Windows Terminal ou em um console novo.
 * **Windows ⚙**: liga/desliga as integrações com o Windows e grava credenciais.
 * `F5` força uma coleta completa. O switch *Alertas* (e o menu da bandeja) silencia os toasts.
 * **Bandeja**: fechar a janela mantém o monitor rodando. Verde = tudo OK, amarelo =
@@ -417,13 +485,54 @@ baixar pela tag. Igual = *em dia*; diferente = *nova versão disponível*. Regis
 privados usam as credenciais já salvas no servidor (`skopeo login`, `podman login` ou
 `docker login`); cada consulta é limitada a 4 s.
 
+## Mudanças seguras em contêineres
+
+Qualquer mudança em contêiner — de qualquer motor com ações (Docker, Podman, nerdctl) —
+segue o mesmo caminho, sempre com confirmação:
+
+1. **Análise antes de executar**: nível de risco (*nenhum, baixo, médio, alto, crítico*) e
+   **o que pode ser afetado**: portas publicadas e endpoints que saem do ar; contêineres
+   que dependem dele (`depends_on` do Compose) e o resto da stack; o papel pela imagem
+   (banco de dados, proxy/entrada, túnel ou VPN de acesso, painel, atualizador,
+   monitoramento); dados gravados **dentro** do contêiner (perdidos ao remover) e volumes
+   anônimos; política de reinício, Swarm e unidades systemd do Podman; memória/disco do
+   host; e, para contêiner novo, conflitos de nome e porta e riscos de segurança
+   (`--privileged`, `docker.sock`, `/` do host, rede do host). Conflitos **bloqueiam**.
+   Parar o túnel/VPN pelo qual o próprio painel chega ao servidor é **crítico** e exige
+   digitar o nome do contêiner.
+2. **Proteções** (as obrigatórias vêm marcadas e travadas): **definição salva neste PC**
+   (`inspect` completo criptografado com **DPAPI** + um `recriar.txt` legível com segredos
+   mascarados e a dica do Compose), **snapshot** (`commit` para
+   `firawynix/backup-<nome>:<data>`) antes de remover, e **backup dos volumes com o
+   contêiner parado** (tar.gz feito por um alpine sem rede, com o volume somente leitura).
+3. **Execução**: parada graciosa (10 s; 30 s para bancos de dados), passo a passo na tela.
+   Passos longos rodam em segundo plano no servidor, acompanhados a cada segundo.
+4. **Verificação**: parou mesmo (e avisa se precisou de SIGKILL)? subiu e ficou estável
+   (detecta *crash* e *restart loop* e mostra as últimas linhas do log)? foi removido?
+5. **Histórico e caminho de volta**: cada mudança fica na visão **Mudanças** com
+   *Iniciar novamente* e *Restaurar* (recria com a mesma imagem, portas, volumes, rede,
+   variáveis, rótulos e limites — ou a partir do snapshot).
+
+**+ Novo contêiner** (com `container_admin`): motor, imagem, nome, portas
+(`8080:80`, `127.0.0.1:5432:5432/tcp`), volumes (`dados:/var/lib/app`, `/srv/site:/usr/share/nginx/html:ro`),
+variáveis, comando, rede, política de reinício e limites de memória/CPU — passa pela
+mesma análise (porta ocupada e nome em uso bloqueiam) antes de baixar a imagem e criar.
+
+Unidades **systemd** também mostram o impacto antes de confirmar (ex.: parar `ssh`,
+`networking` ou o `cloudflared`/VPN pelo qual o painel conecta é crítico; `docker` derruba
+todos os contêineres; bancos, nginx, firewall e fail2ban têm avisos próprios).
+
+Os arquivos locais ficam em `%LOCALAPPDATA%\FirawynixMonitor\backups\<servidor>\<contêiner>\<mudança>`
+e o histórico em `…\backups\mudancas.jsonl`.
+
 ## Integração com a API do Windows
 
 Tudo via `ctypes` (sem dependências extras) e ignorado fora do Windows:
 
 | Recurso | API | Detalhe |
 |---|---|---|
-| Credenciais | `CredWriteW` / `CredReadW` / `CredDeleteW` (advapi32) | Credencial genérica, compatível com `cmdkey` e com o painel *Gerenciador de Credenciais* |
+| Credenciais | `CredWriteW` / `CredReadW` / `CredDeleteW` (advapi32) | Credencial genérica, compatível com `cmdkey` e com o painel *Gerenciador de Credenciais* (senhas, passphrases, host de salto, proxy e token do Cloudflare) |
+| Backups locais | `CryptProtectData` / `CryptUnprotectData` (crypt32, DPAPI) | A definição salva de cada contêiner (variáveis podem ter segredos) só abre com o seu usuário do Windows |
 | Visualizador de Eventos | `RegisterEventSourceW` / `ReportEventW` | Log *Aplicativo*, origem `FirawynixMonitor`; IDs 1001 (falha de serviço), 1002 (recuperado), 1003/1004 (conexão), 1005 (limite), 1006 (endpoint), 1007 (segurança), 1008 (SMART), 1009 (ação executada — trilha de auditoria), 1010 (franquia), 1011 (login SSH) |
 | Barra de título | `DwmSetWindowAttribute` (dwmapi) | Modo escuro + legenda/borda/texto na cor do tema (Windows 11) |
 | Barra de tarefas | `FlashWindowEx` (user32) | Pisca em alertas críticos até a janela receber foco |
@@ -457,8 +566,11 @@ Windows** (grava a chave `Run` do seu usuário; não precisa de administrador).
 
 * **Sem agente**: nada é instalado nos servidores; somente comandos de leitura e as ações
   explicitamente confirmadas pelo usuário.
-* **Sem segredos em texto plano**: `servers.json` só referencia variáveis de ambiente ou
-  credenciais do Windows (DPAPI); URLs de endpoints com usuário/senha são recusadas.
+* **Sem segredos em texto plano**: `servers.json` só referencia variáveis de ambiente,
+  credenciais do Windows (DPAPI) ou "pedir ao conectar" (só em memória); o diálogo
+  **Conexões** grava segredos direto no Gerenciador de Credenciais; o token do Cloudflare
+  vai no ambiente do `cloudflared`, nunca na linha de comando; URLs de endpoints com
+  usuário/senha são recusadas.
 * **Sem senha de sudo**: sempre `sudo -n`; libere o mínimo via sudoers (NOPASSWD).
 * **Chaves de host verificadas**: TOFU (`accept-new`) ou `strict`; chave divergente é
   recusada com alerta de possível *man-in-the-middle*.
@@ -467,6 +579,9 @@ Windows** (grava a chave `Run` do seu usuário; não precisa de administrador).
   `ipaddress`, PIDs são validados (PID 1 nunca), `kubectl_command` e `libvirt_uri` são
   validados na configuração, e todo valor passa por `shlex.quote`; os comandos rodam via
   `sh -c` com `LC_ALL=C`.
+* **Mudanças com análise e volta**: risco e impacto antes, backup obrigatório quando o
+  risco é médio ou maior, verificação depois e restauração pelo histórico; o backup de
+  volumes com sudo usa um script que valida cada argumento (nunca `docker run` livre).
 * **Ações destrutivas desligadas por padrão**: encerrar processos exige
   `process_actions: true`, banir IPs exige `security_actions: true` e remover
   contêineres/imagens/volumes exige `container_admin: true` (contêineres em execução e
@@ -494,7 +609,11 @@ injeção e sintaxe POSIX de cada comando composto), a validação da configura�
 políticas de alerta, o histórico em SQLite (inclusive a migração), os endpoints contra
 servidores HTTP/HTTPS locais com certificados gerados no teste (válido, expirando,
 autoassinado), os layouts das estruturas da API do Windows e o loop do monitor (camadas,
-reconexão, perda de conexão, timeouts, endpoints em segundo plano) com um cliente SSH falso.
+reconexão, perda de conexão, timeouts, endpoints em segundo plano) com um cliente SSH falso,
+os conectores (proxies SOCKS5/HTTP e túnel por processo contra servidores locais, VPN,
+cloudflared com token no ambiente), os modos de autenticação, a análise de risco e o
+executor das mudanças seguras (com um motor falso: backups, verificação, crash, restore),
+os formulários de contêiner novo e a edição do `servers.json` pelo diálogo **Conexões**.
 
 ## Solução de problemas
 
@@ -525,11 +644,18 @@ reconexão, perda de conexão, timeouts, endpoints em segundo plano) com um clie
 | Terminal SSH não abre | Instale o *Cliente OpenSSH* (Configurações > Aplicativos > Recursos opcionais); o comando é copiado para a área de transferência |
 | Toasts não aparecem | Verifique *Configurações > Sistema > Notificações* e o *Não incomodar*. Para outro nome de aplicativo, defina `notifications.app_id` com um AppUserModelID registrado |
 | Evento sem descrição no Visualizador | Registre a origem com `New-EventLog` (veja acima) |
+| "Sem login no Cloudflare Access" | Clique em **Entrar no Cloudflare Access** (em **Conexões** ou no aviso) e conclua no navegador — ou configure um token de serviço. Confira o `cloudflared` com `winget install --id Cloudflare.cloudflared` |
+| "VPN … não responde" | Ligue a VPN (ou defina `up_command`). `check` deve apontar para algo que só responde com a VPN ligada |
+| "O servidor também exige senha (2 fatores)" | O sshd usa `AuthenticationMethods publickey,password`: escolha **Chave SSH + senha** |
+| "Sem credencial … nenhuma chave SSH encontrada" | Informe a chave privada em **Conexões** (ou coloque-a em `~/.ssh`), ou mude o modo para senha/agente |
+| Mudança "backup indisponível" com sudo | Instale `docs/firawynix-volume-backup` e a regra do sudoers (veja *Preparando os servidores*) |
+| "Parado, mas encerrado à força (SIGKILL)" | O processo não tratou o SIGTERM no prazo; em bancos isso exige recuperação na próxima partida. Ajuste o `STOPSIGNAL`/`stop_grace_period` da imagem |
 
 ## Atualizando dependências
 
 As versões em `requirements*.txt` são exatas (incluindo as transitivas) para builds
-reprodutíveis. A v3 (e a 3.1) não adicionaram dependências: as integrações com o Windows usam só a
+reprodutíveis. A v3 (e as 3.1 e 3.2) não adicionaram dependências (conectores, DPAPI e
+mudanças seguras usam só a biblioteca padrão e o Paramiko): as integrações com o Windows usam só a
 biblioteca padrão (`ctypes`, `winreg`) e os certificados são lidos com o `cryptography`
 que o Paramiko já instala. Para atualizar:
 

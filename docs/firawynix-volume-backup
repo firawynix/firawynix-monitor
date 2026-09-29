@@ -1,0 +1,76 @@
+#!/bin/sh
+# firawynix-volume-backup — backup "a frio" de um volume de contêiner.
+#
+# O Firawynix Monitor chama este script com "sudo -n" quando o motor usa sudo
+# (docker_sudo / podman_sudo / nerdctl_sudo) e a mudança pede "Backup dos
+# volumes com o contêiner parado". Assim o sudoers não precisa liberar um
+# "docker run" genérico (que equivale a root): só este script, que valida
+# tudo e faz uma única coisa.
+#
+# Instalação (como root, no servidor):
+#   install -o root -g root -m 0755 firawynix-volume-backup /usr/local/sbin/firawynix-volume-backup
+#   visudo -f /etc/sudoers.d/firawynix-backup
+#       monitor ALL=(root) NOPASSWD: /usr/local/sbin/firawynix-volume-backup
+#
+# Uso: firawynix-volume-backup <docker|podman|nerdctl> <volume> <arquivo.tar.gz>
+#
+# - O volume é montado SOMENTE LEITURA num contêiner alpine SEM REDE.
+# - O arquivo só pode ser gravado em /var/backups/firawynix (pasta do root,
+#   0750, grupo do usuário que chamou o sudo) e nunca sobrescreve outro.
+# - Nomes aceitos: volume [A-Za-z0-9][A-Za-z0-9_.-]* (até 255) e arquivo
+#   [A-Za-z0-9][A-Za-z0-9_.-]*.tar.gz (até 208) — sem "/", espaços ou quebras.
+set -eu
+LC_ALL=C
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL PATH
+
+DEST=/var/backups/firawynix
+IMAGE=docker.io/library/alpine:3.20
+
+fail() {
+    code=$1
+    shift
+    echo "firawynix-volume-backup: $*" >&2
+    exit "$code"
+}
+
+[ "$#" -eq 3 ] || fail 64 "uso: firawynix-volume-backup <docker|podman|nerdctl> <volume> <arquivo.tar.gz>"
+engine=$1
+volume=$2
+file=$3
+
+case "$engine" in
+    docker|podman|nerdctl) ;;
+    *) fail 64 "motor inválido: $engine" ;;
+esac
+
+case "$volume" in
+    ''|[!A-Za-z0-9]*|*[!A-Za-z0-9_.-]*) fail 64 "nome de volume inválido" ;;
+esac
+[ "${#volume}" -le 255 ] || fail 64 "nome de volume longo demais"
+
+case "$file" in
+    [!A-Za-z0-9]*|*[!A-Za-z0-9_.-]*) fail 64 "nome de arquivo inválido" ;;
+    *.tar.gz) ;;
+    *) fail 64 "o arquivo precisa terminar em .tar.gz" ;;
+esac
+[ "${#file}" -le 208 ] || fail 64 "nome de arquivo longo demais"
+
+group=${SUDO_GID:-0}
+case "$group" in
+    ''|*[!0-9]*) fail 64 "SUDO_GID inválido" ;;
+esac
+
+command -v "$engine" >/dev/null 2>&1 || fail 69 "$engine não encontrado"
+"$engine" volume inspect "$volume" >/dev/null 2>&1 || fail 66 "volume não encontrado: $volume"
+
+install -d -o root -g "$group" -m 0750 "$DEST"
+out="$DEST/$file"
+[ ! -e "$out" ] || fail 73 "já existe: $out"
+
+umask 027
+"$engine" run --rm --network none -v "$volume:/data:ro" -v "$DEST:/backup" "$IMAGE" \
+    tar czf "/backup/$file" -C /data .
+chown "root:$group" "$out"
+chmod 0640 "$out"
+echo "$out"

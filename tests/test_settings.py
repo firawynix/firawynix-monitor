@@ -38,8 +38,13 @@ def test_full_example_file_is_valid():
     example = json.loads((Path(__file__).parent.parent / "servers.example.json").read_text(encoding="utf-8"))
     for server in example["servers"]:
         server.pop("key_file", None)  # a chave do exemplo não existe na máquina de teste
+        if isinstance(server.get("connector"), dict):
+            server["connector"].pop("key_file", None)
     config = parse_config(example)
     assert len(config.servers) >= 2
+    # O exemplo mostra todos os conectores e modos de autenticação mais usados.
+    assert {s.connector.type for s in config.servers} >= {"cloudflared", "vpn", "jump", "socks5", "direct"}
+    assert {s.auth for s in config.servers} >= {"key", "key+password", "password", "agent", "auto"}
 
 
 @pytest.mark.parametrize(("key", "hint"), [

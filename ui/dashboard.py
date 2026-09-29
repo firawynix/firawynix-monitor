@@ -9,6 +9,7 @@ menu da bandeja) por :meth:`Dashboard.call_in_ui`; ambos são drenados por
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import queue
 import shutil
@@ -24,15 +25,17 @@ from pathlib import Path
 
 import customtkinter as ctk
 
-from config.preferences import Preferences, engine_preference_key
+from config.preferences import Preferences, apply_engine_preferences, engine_preference_key
 from config.settings import Config, ServerConfig
 from core import containers as engines
 from core import winapi
+from core.changes import ChangeAction, Risk, unit_impacts
 from core.history import HistoryStore
 from core.models import (
     ActionOutcome,
     ActionResultEvent,
     AlertKind,
+    ChangeProgressEvent,
     ContainerImage,
     CheckLevel,
     ConnectionEvent,
@@ -53,9 +56,12 @@ from core.models import (
 from core.monitor import MonitorManager
 from core.notifier import Notifier
 from ui import theme
+from ui.change_dialog import ChangeDialog
+from ui.connections_dialog import ConnectionsDialog
 from ui.containers_tab import ContainersTab, selection_summary
 from ui.engines_dialog import EnginesDialog
 from ui.options import WindowsOptionsDialog
+from ui.secret_prompt import SecretPromptDialog
 from ui.security_tab import SecurityTab
 from ui.tabs import (
     EventsTab,
@@ -129,6 +135,13 @@ class Dashboard(ctk.CTk):
         self._connections: dict[str, ConnectionEvent] = {}
         self._offline_notified: set[str] = set()
         self._busy: dict[str, str] = {}
+        #: Diálogos de mudança segura em andamento (id da mudança → diálogo).
+        self._change_dialogs: dict[str, ChangeDialog] = {}
+        #: Pedidos de segredo/login vindos da conexão: abertos agora, recusados ("Agora não") e pendentes
+        #: (janela escondida na bandeja). Chave: "<servidor>|<o que falta>".
+        self._needs_open: set[str] = set()
+        self._needs_dismissed: set[str] = set()
+        self._needs_pending: dict[str, ConnectionEvent] = {}
         self._current: str | None = None if len(app_config.servers) > 1 else app_config.servers[0].name
         self._tray = None
         self._hidden_hint_shown = False
@@ -190,6 +203,9 @@ class Dashboard(ctk.CTk):
                                            fg_color=theme.NEUTRAL, hover_color=theme.NEUTRAL_HOVER,
                                            text_color=theme.TEXT)
         self._terminal_btn.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(controls, text="Conexões", width=96, command=lambda: self.open_connections(self._current),
+                      fg_color=theme.NEUTRAL, hover_color=theme.NEUTRAL_HOVER,
+                      text_color=theme.TEXT).pack(side="left", padx=(0, 8))
         ctk.CTkButton(controls, text="Windows ⚙", width=104, command=self.open_options, fg_color=theme.NEUTRAL,
                       hover_color=theme.NEUTRAL_HOVER, text_color=theme.TEXT).pack(side="left", padx=(0, 12))
         ctk.CTkLabel(controls, text="Intervalo").pack(side="left", padx=(0, 6))
@@ -294,6 +310,9 @@ class Dashboard(ctk.CTk):
     def run_service_action(self, server: str, service: ServiceInfo, action: ServiceAction) -> None:
         if not self._ensure_connected(server):
             return
+        if service.kind.manageable:  # contêineres: análise de risco, backup, execução e verificação
+            self.open_change(server, ChangeAction(action.value), service=service)
+            return
         noun = {ServiceKind.SYSTEMD: "a unidade", ServiceKind.KUBERNETES: "o pod",
                 ServiceKind.LIBVIRT: "a VM"}.get(service.kind, "o contêiner")
         message = f"Deseja {action.label.lower()} {noun} \"{service.name}\" em {server}?"
@@ -306,7 +325,15 @@ class Dashboard(ctk.CTk):
             message += "\n\nAtenção: este item está marcado como CRÍTICO."
         if action is ServiceAction.STOP:
             message += "\n\nEle ficará indisponível até ser iniciado novamente."
-        if not self.confirm(f"{action.label} {service.name}", message, action.label, action is ServiceAction.STOP):
+        danger = action is ServiceAction.STOP
+        if service.kind is ServiceKind.SYSTEMD:
+            impacts = unit_impacts(service.name, action.value, self.server_config(server).connector.type)
+            if impacts:
+                worst = max(i.level for i in impacts)
+                message += f"\n\nRISCO {worst.label.upper()} — o que pode ser afetado:\n" + "\n".join(
+                    f"• {i.area}: {i.title}" for i in impacts)
+                danger = danger or worst >= Risk.HIGH
+        if not self.confirm(f"{action.label} {service.name}", message, action.label, danger):
             return
         self._mark_busy(server, service.key, action.progress_label, service.name)
         self.manager.run_action(server, service, action)
@@ -348,9 +375,51 @@ class Dashboard(ctk.CTk):
         self._mark_busy(server, f"ip:{ip}", "Banindo" if ban else "Desbanindo", ip)
         self.manager.fail2ban_action(server, jail, ip, ban)
 
+    def open_change(self, server: str, action: ChangeAction, *, service: ServiceInfo | None = None,
+                    spec=None, record=None, use_snapshot: bool = False) -> None:
+        """Mudança segura: analisar risco → informar impacto → salvar → executar → confirmar."""
+        if not self._ensure_connected(server):
+            return
+        ChangeDialog(self, server, action, service=service, spec=spec, record=record, use_snapshot=use_snapshot)
+
+    def open_new_container(self, server: str) -> None:
+        from ui.new_container_dialog import NewContainerDialog
+
+        if self._ensure_connected(server):
+            NewContainerDialog(self, server)
+
+    def register_change(self, change_id: str, dialog: ChangeDialog) -> None:
+        self._change_dialogs[change_id] = dialog
+
+    def _on_change_progress(self, event: ChangeProgressEvent) -> None:
+        dialog = self._change_dialogs.get(event.change_id)
+        if dialog is not None:
+            try:
+                dialog.on_progress(event)
+            except tk.TclError:  # diálogo fechado: a mudança continua em segundo plano
+                self._change_dialogs.pop(event.change_id, None)
+        if not event.finished:
+            return
+        self._change_dialogs.pop(event.change_id, None)
+        record = next((r for r in self.manager.change_records(event.server) if r.id == event.record_id), None)
+        what = f"{record.action} {record.target}" if record else event.change_id
+        level = {"ok": "info", "warning": "warning"}.get(event.outcome, "error")
+        self.log_windows_event(f"[{event.server}] Mudança segura '{what}': {event.outcome} — {event.message}",
+                               level, "action")
+        text = {"ok": "concluída", "warning": "concluída com avisos", "error": "NÃO concluída"}.get(event.outcome,
+                                                                                                    event.outcome)
+        self.set_status(f"[{event.server}] Mudança {what} {text}. {event.message}", error=event.outcome == "error",
+                        warning=event.outcome == "warning")
+        if dialog is None or not dialog.winfo_exists():
+            self._notifier.notify(f"Mudança {text}: {what}", f"{event.server} · {event.message}"[:200])
+
     def container_op(self, server: str, service: ServiceInfo, op: str) -> None:
         """Pausar / retomar / remover — o mesmo diálogo para Docker, Podman e containerd."""
         if not self._ensure_connected(server):
+            return
+        mapped = {"pause": ChangeAction.PAUSE, "unpause": ChangeAction.UNPAUSE, "rm": ChangeAction.REMOVE}.get(op)
+        if mapped is not None and service.kind.manageable:
+            self.open_change(server, mapped, service=service)
             return
         engine = service.kind.label
         if op == "pause":
@@ -437,6 +506,108 @@ class Dashboard(ctk.CTk):
             self.set_status(f"Não foi possível abrir o navegador ({exc}). Endereço copiado.", warning=True)
             return
         self.set_status(f"Abrindo {url} no navegador…")
+
+    # -- servidores e conexões -----------------------------------------------------
+
+    @property
+    def config_source(self) -> Path | None:
+        """servers.json em uso (None no modo demonstração: nada é gravado)."""
+        return self._config.source
+
+    def config_servers(self) -> tuple[ServerConfig, ...]:
+        return self._config.servers
+
+    def open_connections(self, server: str | None = None) -> None:
+        # Quem abre o diálogo quer ver/ajustar a conexão: volta a perguntar segredos recusados antes.
+        self._needs_dismissed = {k for k in self._needs_dismissed if server and not k.startswith(f"{server}|")}
+        ConnectionsDialog(self, server)
+
+    def apply_config(self, config: Config) -> dict[str, list[str]]:
+        """Aplica o servers.json editado sem reiniciar: só o servidor alterado reconecta."""
+        config = apply_engine_preferences(dataclasses.replace(config, source=self._config.source), self.preferences)
+        result = self.manager.apply_config(config)
+        self._config = config
+        for name in result["removed"] + result["updated"]:
+            self._connections.pop(name, None)
+            self._offline_notified.discard(name)
+            for key in [k for k in self._needs_dismissed | set(self._needs_pending) if k.startswith(f"{name}|")]:
+                self._needs_dismissed.discard(key)
+                self._needs_pending.pop(key, None)
+        for name in result["removed"]:
+            self._snapshots.pop(name, None)
+            self._busy = {k: v for k, v in self._busy.items() if not k.startswith(f"{name}|")}
+        if self._current is not None and self._current not in self.manager.monitors:
+            self.select_server(None if len(self.manager.server_names) != 1 else self.manager.server_names[0])
+        else:
+            self._render_all()
+        changed = [f"{label}: {', '.join(result[key])}" for key, label in
+                   (("added", "novos"), ("updated", "atualizados"), ("removed", "removidos")) if result[key]]
+        if changed:
+            self.log_windows_event(f"Servidores e conexões alterados ({'; '.join(changed)}).", "info", "app")
+        return result
+
+    def _on_connection_needs(self, server: str, event: ConnectionEvent) -> None:
+        """A conexão parou por falta de senha/passphrase ("pedir ao conectar") ou de login no Cloudflare."""
+        key = f"{server}|{event.needs}|{event.needs_target}"
+        if key in self._needs_open or key in self._needs_dismissed:
+            return
+        if not self.winfo_viewable():  # escondido na bandeja: avisa e pergunta quando a janela voltar
+            if key not in self._needs_pending:
+                self._notifier.notify(f"{server}: ação necessária para conectar", event.message,
+                                      key=f"{server}:needs")
+            self._needs_pending[key] = event
+            return
+        self._needs_pending.pop(key, None)
+        self._needs_open.add(key)
+        self.after(0, lambda: self._ask_needs(server, key, event))
+
+    def _ask_needs(self, server: str, key: str, event: ConnectionEvent) -> None:
+        try:
+            if server not in self.manager.monitors:
+                return
+            if event.needs in ("password", "passphrase"):
+                dialog = SecretPromptDialog(self, server, event.needs_target or server, event.needs, event.message)
+                self.wait_window(dialog)
+                if not dialog.submitted:
+                    self._needs_dismissed.add(key)
+                    self.set_status(f"[{server}] Sem o segredo não há conexão. Informe em \"Conexões\".",
+                                    warning=True)
+            elif event.needs == "cloudflare-login":
+                if self.confirm("Login no Cloudflare Access",
+                                f"{server} é acessado pelo Cloudflare Tunnel e ainda não há login salvo neste PC.\n\n"
+                                "Abrir o navegador para entrar agora? Depois do login, o cloudflared guarda o "
+                                "token e o painel reconecta sozinho.", "Abrir o navegador"):
+                    self._cloudflare_login(server)
+                else:
+                    self._needs_dismissed.add(key)
+        finally:
+            self._needs_open.discard(key)
+
+    def _cloudflare_login(self, server: str) -> None:
+        from core.connectors import ConnectorError, cloudflared_login
+
+        try:
+            process = cloudflared_login(self.server_config(server))
+        except (ConnectorError, OSError) as exc:
+            self.set_status(f"[{server}] Login no Cloudflare Access: {exc}", error=True)
+            return
+        self.set_status(f"[{server}] Conclua o login do Cloudflare Access no navegador…")
+        deadline = time.monotonic() + 600
+
+        def wait() -> None:
+            code = process.poll()
+            if code is None and time.monotonic() < deadline:
+                self.after(1000, wait)
+                return
+            if code == 0 and server in self.manager.monitors:
+                self.manager.reconnect(server)
+                self.set_status(f"[{server}] Login no Cloudflare Access concluído. Conectando…")
+            else:
+                if code is None:
+                    process.kill()
+                self.set_status(f"[{server}] O login no Cloudflare Access não foi concluído.", warning=True)
+
+        self.after(1000, wait)
 
     def open_engines_dialog(self, server: str | None = None) -> None:
         EnginesDialog(self, server or self._current)
@@ -531,6 +702,9 @@ class Dashboard(ctk.CTk):
         self.focus_force()
         self.attributes("-topmost", True)
         self.after(250, lambda: self.attributes("-topmost", False))
+        pending, self._needs_pending = self._needs_pending, {}
+        for event in pending.values():
+            self.after(400, lambda e=event: self._on_connection_needs(e.server, e))
 
     def hide_to_tray(self) -> None:
         self.withdraw()
@@ -540,6 +714,9 @@ class Dashboard(ctk.CTk):
                                              "Use o ícone na bandeja para reabrir.", force=True)
 
     def refresh_current(self) -> None:
+        # "Atualizar" também volta a perguntar a senha/login recusados antes.
+        self._needs_dismissed = {k for k in self._needs_dismissed
+                                 if self._current is not None and not k.startswith(f"{self._current}|")}
         if self._current is None:
             self.refresh_all()
             return
@@ -580,8 +757,10 @@ class Dashboard(ctk.CTk):
             self._launch_ssh(self._current)
 
     def _launch_ssh(self, name: str, remote_command: str | None = None, title: str | None = None) -> None:
+        from core.connectors import openssh_args
+
         server = self.server_config(name)
-        args = ["ssh", "-p", str(server.port)]
+        args = ["ssh", "-p", str(server.port), *openssh_args(server)]
         if server.key_file:
             args += ["-i", str(server.key_file)]
         if remote_command:
@@ -878,6 +1057,8 @@ class Dashboard(ctk.CTk):
 
     def _handle_event(self, event: MonitorEvent, dirty: set[str], alerts: list[ServiceAlertEvent]) -> None:
         server = event.server
+        if server not in self.manager.monitors:
+            return  # servidor removido em "Servidores e conexões" (evento que já estava na fila)
         if isinstance(event, SnapshotEvent):
             self._snapshots[server] = event.snapshot
             dirty.add(server)
@@ -885,6 +1066,8 @@ class Dashboard(ctk.CTk):
             previous = self._connections.get(server)
             self._connections[server] = event
             self._notify_connection_change(server, previous, event)
+            if event.needs:
+                self._on_connection_needs(server, event)
             dirty.add(server)
         elif isinstance(event, ServiceAlertEvent):
             alerts.append(event)
@@ -897,6 +1080,10 @@ class Dashboard(ctk.CTk):
             self._busy.pop(f"{server}|{event.busy_key}", None)
             self._on_action_result(event)
             dirty.add(server)
+        elif isinstance(event, ChangeProgressEvent):
+            self._on_change_progress(event)
+            if event.finished:
+                dirty.add(server)
 
     def _on_action_result(self, event: ActionResultEvent) -> None:
         result = event.result
