@@ -559,6 +559,12 @@ ciano embutido). Manualmente: `pip install -r requirements-dev.txt` e
 `pyinstaller --noconfirm --clean FirawynixMonitor.spec`. Distribua o `.exe` com um
 `servers.json` na mesma pasta.
 
+**Sem compilar**: a cada push o GitHub Actions gera o executável num Windows de verdade,
+roda-o por 20 s em modo demonstração e publica o pacote — na aba **Actions**, abra a
+execução mais recente do workflow **CI** e baixe o artefato **FirawynixMonitor-windows**
+(`FirawynixMonitor.exe`, o `.sha256`, `servers.example.json`, `.env.example`, o
+`sudoers.example` e o script `firawynix-volume-backup`).
+
 **Iniciar junto com o Windows**: use o menu da bandeja ou **Windows ⚙ → Iniciar com o
 Windows** (grava a chave `Run` do seu usuário; não precisa de administrador).
 
@@ -597,7 +603,19 @@ Windows** (grava a chave `Run` do seu usuário; não precisa de administrador).
 ```powershell
 pip install -r requirements-dev.txt
 python -m pytest
+python scripts\smoke_ui.py --out capturas   # fumaça da interface (modo demonstração)
 ```
+
+O CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) roda o `ruff`, os testes
+no **Windows** (Python 3.11 e 3.13) e no Linux, a fumaça da interface num Windows real
+(com capturas de tela como artefato) e o build do `.exe`. No Windows também rodam os
+testes que chamam a API de verdade — Gerenciador de Credenciais (inclusive o que o
+`cmdkey` grava e o token do Cloudflare), DPAPI (ida e volta e adulteração), definições
+criptografadas dos backups, Visualizador de Eventos, chave `Run`, ICMP e o `cloudflared`
+em *Arquivos de Programas* — e os testes de SSH contra um servidor Paramiko no próprio
+processo (senha, chave + senha, pedir ao conectar, chave de host trocada e o túnel por
+processo filho usado pelo cloudflared). Testes marcados `posix_shell` executam os
+comandos do servidor num `sh` real e só rodam no Linux.
 
 Cobrem os parsers (formatos modernos e legados de `systemctl`, `docker`/`podman`/`nerdctl`,
 `crictl`, `buildah`, `skopeo` e a auto-detecção de motores,
