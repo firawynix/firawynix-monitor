@@ -2,18 +2,37 @@
   "_comment": "Copie para servers.json. Segredos NUNCA ficam aqui: use password_env/key_passphrase_env (variáveis de ambiente ou .env).",
   "settings": {
     "poll_interval_seconds": 5,
+    "detail_interval_seconds": 15,
+    "inventory_interval_seconds": 60,
+    "updates_interval_seconds": 1800,
     "command_timeout_seconds": 5,
     "connect_timeout_seconds": 5,
     "minimize_to_tray": true,
     "start_minimized": false,
     "appearance_mode": "dark",
     "log_lines": 50,
+    "process_limit": 200,
     "notifications": {
       "enabled": true,
       "notify_on_recovery": true,
       "notify_on_disconnect": true,
       "alert_on_stop": false,
       "cooldown_seconds": 120
+    },
+    "thresholds": {
+      "cpu_percent": 90,
+      "mem_percent": 90,
+      "disk_percent": 90,
+      "sustain_polls": 3
+    },
+    "history": {
+      "enabled": true,
+      "retention_days": 7
+    },
+    "events": {
+      "priority": "err",
+      "limit": 100,
+      "since_hours": 24
     }
   },
   "servers": [
@@ -27,8 +46,28 @@
       "use_sudo": true,
       "docker": "auto",
       "docker_sudo": false,
-      "critical_services": ["nginx", "postgresql*", "redis-server", "docker:api", "docker:worker"],
+      "network_sudo": false,
+      "critical_services": ["nginx", "postgresql*", "redis-server", "docker:shop-*"],
       "exclude_services": ["systemd-*", "getty@*", "user@*"]
+    },
+    {
+      "name": "k3s-edge",
+      "host": "10.0.20.11",
+      "username": "monitor",
+      "kubernetes": "on",
+      "kubectl_command": "k3s kubectl",
+      "kubectl_sudo": true,
+      "podman": "off",
+      "critical_services": ["k3s", "k8s:prod/*"]
+    },
+    {
+      "name": "hv-01",
+      "host": "10.0.30.5",
+      "username": "monitor",
+      "libvirt": "on",
+      "libvirt_uri": "qemu:///system",
+      "process_actions": true,
+      "critical_services": ["libvirtd", "vm:*"]
     },
     {
       "name": "staging",
@@ -38,6 +77,7 @@
       "password_env": "STAGING_SSH_PASSWORD",
       "host_key_policy": "strict",
       "docker": "off",
+      "unit_types": ["service", "timer"],
       "poll_interval_seconds": 10
     }
   ]

@@ -1,40 +1,44 @@
-"""Conexão SSH (Paramiko), execução de comandos com timeout rígido e parsers.
+"""Conexão SSH (Paramiko), execução com timeout rígido e operações de alto nível.
 
-Organização do módulo:
-
-1. Exceções
-2. Construção/validação de comandos remotos (sem efeitos colaterais)
-3. Parsers das saídas de ``systemctl``, ``docker``, ``/proc``, ``free`` e ``df``
-4. :class:`SSHClient` — conexão, timeout por comando e operações de alto nível
-
-Os parsers e os construtores de comando são funções puras e testáveis sem rede.
+* :mod:`core.commands` monta os comandos (validação + quoting);
+* :mod:`core.parsers` interpreta as saídas;
+* este módulo cuida da conexão, do timeout de cada comando e de traduzir
+  resultados/erros para os modelos de :mod:`core.models`.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import re
-import shlex
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import paramiko
 
 from config.settings import MAX_COMMAND_TIMEOUT, ServerConfig
+from core import commands as cmd
+from core import parsers
 from core.models import (
+    SYSTEMD_UNIT_TYPES,
     ActionOutcome,
     ActionResult,
-    DiskUsage,
-    DockerResult,
-    DockerState,
+    CronEntry,
     HostMetrics,
+    JournalEntry,
+    NetworkInfo,
+    ProcessInfo,
+    RuntimeResult,
+    RuntimeState,
     ServiceAction,
     ServiceInfo,
     ServiceKind,
-    ServiceStatus,
+    Stack,
+    SystemInfo,
+    TimerInfo,
+    UpdatesInfo,
 )
 
 log = logging.getLogger(__name__)
@@ -46,7 +50,7 @@ KEEPALIVE_SECONDS = 15
 
 
 # ---------------------------------------------------------------------------
-# 1. Exceções
+# Exceções
 # ---------------------------------------------------------------------------
 
 class SSHError(Exception):
@@ -96,436 +100,7 @@ class CommandResult:
 
 
 # ---------------------------------------------------------------------------
-# 2. Construção e validação de comandos
-# ---------------------------------------------------------------------------
-
-# Nomes de unidade systemd: letras, dígitos e ":-_.\@" (o "\" aparece em nomes
-# escapados, ex.: systemd-fsck@dev-disk-by\x2duuid-....service). Não pode começar
-# com "-" para nunca ser interpretado como opção.
-_UNIT_NAME_RE = re.compile(r"[A-Za-z0-9_@:.\\][A-Za-z0-9_@:.\\-]{0,255}")
-# Nomes de contêiner Docker: [a-zA-Z0-9][a-zA-Z0-9_.-]+ (ou ID hexadecimal).
-_CONTAINER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}")
-
-SYSTEMCTL_JSON_CMD = "systemctl list-units --type=service --all --no-pager --output=json"
-SYSTEMCTL_TABLE_CMD = "systemctl list-units --type=service --all --no-pager --plain --no-legend"
-DOCKER_PS_ARGS = "ps -a --format '{{json .}}'"
-
-_SECTION = "__FWX_SECTION__"
-
-
-def validate_unit_name(name: str) -> str:
-    if not _UNIT_NAME_RE.fullmatch(name or ""):
-        raise ValueError(f"Nome de serviço inválido: {name!r}")
-    return name
-
-
-def validate_container_name(name: str) -> str:
-    if not _CONTAINER_NAME_RE.fullmatch(name or ""):
-        raise ValueError(f"Nome de contêiner inválido: {name!r}")
-    return name
-
-
-def _sudo(use_sudo: bool) -> str:
-    # -n (non-interactive): nunca pede senha; falha imediatamente se o sudoers
-    # não liberar o comando com NOPASSWD.
-    return "sudo -n " if use_sudo else ""
-
-
-def build_service_action_command(unit: str, action: ServiceAction, use_sudo: bool) -> str:
-    """``systemctl --no-block <ação> <unidade>``.
-
-    ``--no-block`` enfileira o job e retorna imediatamente: serviços lentos
-    aparecem como "Iniciando" na próxima coleta sem estourar o timeout de 5 s.
-    """
-    unit = validate_unit_name(unit)
-    return f"{_sudo(use_sudo)}systemctl --no-block {action.value} {shlex.quote(unit)}"
-
-
-def build_journal_command(unit: str, lines: int, use_sudo: bool) -> str:
-    unit = validate_unit_name(unit)
-    return f"{_sudo(use_sudo)}journalctl -u {shlex.quote(unit)} -n {int(lines)} --no-pager"
-
-
-def build_docker_action_command(container: str, action: ServiceAction, use_sudo: bool) -> str:
-    container = validate_container_name(container)
-    # -t 3: aguarda no máximo 3 s pelo SIGTERM antes do SIGKILL (cabe no timeout).
-    stop_timeout = "" if action is ServiceAction.START else " -t 3"
-    return f"{_sudo(use_sudo)}docker {action.value}{stop_timeout} {shlex.quote(container)}"
-
-
-def build_docker_logs_command(container: str, lines: int, use_sudo: bool) -> str:
-    container = validate_container_name(container)
-    return f"{_sudo(use_sudo)}docker logs --tail {int(lines)} --timestamps {shlex.quote(container)} 2>&1"
-
-
-def build_docker_ps_command(use_sudo: bool) -> str:
-    return f"{_sudo(use_sudo)}docker {DOCKER_PS_ARGS}"
-
-
-def build_metrics_command(sample_cpu_twice: bool) -> str:
-    """Um único round-trip para uptime, load, CPU, memória e disco."""
-    cpu = "grep '^cpu ' /proc/stat"
-    if sample_cpu_twice:
-        # Primeira coleta: duas amostras para já exibir o uso de CPU.
-        cpu = f"{cpu}; sleep 0.5; {cpu}"
-    parts = [
-        "cat /proc/uptime",
-        "cat /proc/loadavg",
-        "nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo",
-        cpu,
-        "free -m",
-        # timeout: um mount de rede travado (NFS) não pode segurar a coleta inteira.
-        "if command -v timeout >/dev/null 2>&1; then timeout 2 df -kP; else df -kP; fi 2>/dev/null",
-    ]
-    return f"; echo {_SECTION}; ".join(f"{{ {part}; }}" for part in parts)
-
-
-def wrap_remote_command(command: str) -> str:
-    """Executa via ``sh -c`` com locale C: saída previsível para os parsers
-    independentemente do shell de login (bash, zsh, fish...)."""
-    return f"env LC_ALL=C LANG=C sh -c {shlex.quote(command)}"
-
-
-# ---------------------------------------------------------------------------
-# 3. Parsers
-# ---------------------------------------------------------------------------
-
-_SYSTEMD_TRANSITIONAL = {"activating", "reloading", "refreshing"}
-
-
-def classify_systemd(active: str, sub: str) -> ServiceStatus:
-    active = active.lower()
-    if active == "failed":
-        return ServiceStatus.FAILED
-    if active in _SYSTEMD_TRANSITIONAL:
-        return ServiceStatus.ACTIVATING
-    if active == "active":
-        return ServiceStatus.ACTIVE
-    if active in {"inactive", "deactivating"}:
-        return ServiceStatus.STOPPED
-    return ServiceStatus.UNKNOWN
-
-
-def _make_unit(unit: str, load: str, active: str, sub: str, description: str) -> ServiceInfo | None:
-    if not unit or load == "not-found":
-        # Unidades referenciadas mas inexistentes poluem a lista (--all).
-        return None
-    return ServiceInfo(
-        kind=ServiceKind.SYSTEMD,
-        name=unit,
-        description=description,
-        status=classify_systemd(active, sub),
-        active_state=active,
-        sub_state=sub,
-        load_state=load,
-    )
-
-
-def parse_systemctl_json(output: str) -> list[ServiceInfo]:
-    data = json.loads(output)
-    if not isinstance(data, list):
-        raise ValueError("Saída JSON do systemctl não é uma lista")
-    services: list[ServiceInfo] = []
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        entry = {str(k).lower(): ("" if v is None else str(v)) for k, v in item.items()}
-        service = _make_unit(
-            entry.get("unit") or entry.get("name", ""),
-            entry.get("load", ""),
-            entry.get("active", ""),
-            entry.get("sub", ""),
-            entry.get("description", ""),
-        )
-        if service is not None:
-            services.append(service)
-    return services
-
-
-def parse_systemctl_table(output: str) -> list[ServiceInfo]:
-    """Fallback para systemd antigos (sem ``--output=json`` em list-units)."""
-    services: list[ServiceInfo] = []
-    for raw_line in output.splitlines():
-        line = raw_line.strip()
-        # Marcador de falha: "●" (UTF-8) ou "*" (locale C).
-        line = line.lstrip("●*").strip()
-        if not line or line.startswith(("UNIT ", "LOAD ", "To show all")):
-            continue
-        parts = line.split(None, 4)
-        if len(parts) < 4 or not parts[0].endswith(".service"):
-            continue
-        unit, load, active, sub = parts[:4]
-        description = parts[4] if len(parts) > 4 else ""
-        service = _make_unit(unit, load, active, sub, description)
-        if service is not None:
-            services.append(service)
-    return services
-
-
-# Códigos de saída típicos de parada intencional (docker stop / Ctrl+C):
-# 0, SIGINT (130), SIGKILL após timeout do stop (137) e SIGTERM (143).
-_DOCKER_CLEAN_EXIT_CODES = {0, 130, 137, 143}
-_EXIT_CODE_RE = re.compile(r"\((-?\d+)\)")
-
-
-def classify_docker(state: str, status_text: str) -> ServiceStatus:
-    state = (state or "").lower()
-    status_lower = (status_text or "").lower()
-    if not state:
-        # Versões antigas do Docker não expõem .State: deduz pelo texto.
-        for prefix, derived in (("up", "running"), ("exited", "exited"), ("restarting", "restarting"),
-                                ("created", "created"), ("dead", "dead"), ("removal", "removing")):
-            if status_lower.startswith(prefix):
-                state = derived
-                break
-        if "(paused)" in status_lower:
-            state = "paused"
-
-    code_match = _EXIT_CODE_RE.search(status_text or "")
-    exit_code = int(code_match.group(1)) if code_match else None
-
-    if state == "running":
-        if "(unhealthy)" in status_lower:
-            return ServiceStatus.FAILED
-        if "health: starting" in status_lower:
-            return ServiceStatus.ACTIVATING
-        return ServiceStatus.ACTIVE
-    if state == "restarting":
-        # Reiniciando com código de erro = loop de crash.
-        return ServiceStatus.FAILED if exit_code not in (None, 0) else ServiceStatus.ACTIVATING
-    if state == "exited":
-        return ServiceStatus.STOPPED if exit_code in _DOCKER_CLEAN_EXIT_CODES else ServiceStatus.FAILED
-    if state == "dead":
-        return ServiceStatus.FAILED
-    if state in {"created", "paused", "removing"}:
-        return ServiceStatus.STOPPED
-    return ServiceStatus.UNKNOWN
-
-
-def parse_docker_ps(output: str) -> list[ServiceInfo]:
-    containers: list[ServiceInfo] = []
-    for line in output.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            item = json.loads(line)
-        except json.JSONDecodeError:
-            log.debug("Linha do docker ps ignorada: %r", line)
-            continue
-        names = str(item.get("Names") or item.get("ID") or "").split(",")
-        name = names[0].strip().lstrip("/")
-        if not name:
-            continue
-        state = str(item.get("State") or "")
-        status_text = str(item.get("Status") or "")
-        containers.append(ServiceInfo(
-            kind=ServiceKind.DOCKER,
-            name=name,
-            description=str(item.get("Image") or ""),
-            status=classify_docker(state, status_text),
-            active_state=state or "?",
-            sub_state=status_text,
-        ))
-    return containers
-
-
-def classify_docker_error(result: CommandResult) -> tuple[DockerState, str]:
-    text = result.output
-    lower = text.lower()
-    if result.exit_code == 127 or "command not found" in lower or ("not found" in lower and "docker:" in lower):
-        return DockerState.NOT_INSTALLED, "Docker não instalado neste host."
-    if "permission denied" in lower and "docker" in lower:
-        return DockerState.PERMISSION, (
-            "Sem permissão no socket do Docker. Adicione o usuário ao grupo 'docker' "
-            "ou habilite \"docker_sudo\" (com NOPASSWD no sudoers)."
-        )
-    if "a password is required" in lower or "a terminal is required" in lower:
-        return DockerState.PERMISSION, "sudo exige senha para o docker; configure NOPASSWD no sudoers."
-    if ("cannot connect to the docker daemon" in lower or "daemon running" in lower
-            or "daemon is running" in lower or "failed to connect to the docker api" in lower):
-        return DockerState.DAEMON_DOWN, "Daemon do Docker não está em execução."
-    first_line = text.splitlines()[0] if text else f"código de saída {result.exit_code}"
-    return DockerState.ERROR, f"Erro ao consultar o Docker: {first_line}"
-
-
-def parse_uptime(text: str) -> float | None:
-    try:
-        return float(text.split()[0])
-    except (IndexError, ValueError):
-        return None
-
-
-def parse_loadavg(text: str) -> tuple[float, float, float] | None:
-    try:
-        one, five, fifteen = (float(v) for v in text.split()[:3])
-    except ValueError:
-        return None
-    return one, five, fifteen
-
-
-def parse_cpu_count(text: str) -> int | None:
-    try:
-        return int(text.strip().splitlines()[0])
-    except (IndexError, ValueError):
-        return None
-
-
-def parse_cpu_samples(text: str) -> list[tuple[int, int]]:
-    """Linhas ``cpu ...`` de /proc/stat → lista de (ocioso, total) em jiffies."""
-    samples: list[tuple[int, int]] = []
-    for line in text.splitlines():
-        fields = line.split()
-        if not fields or fields[0] != "cpu":
-            continue
-        try:
-            values = [int(v) for v in fields[1:]]
-        except ValueError:
-            continue
-        if len(values) < 4:
-            continue
-        # user nice system idle iowait irq softirq steal (guest já está em user)
-        core = values[:8]
-        idle = core[3] + (core[4] if len(core) > 4 else 0)
-        samples.append((idle, sum(core)))
-    return samples
-
-
-def cpu_percent_between(previous: tuple[int, int], current: tuple[int, int]) -> float | None:
-    idle_delta = current[0] - previous[0]
-    total_delta = current[1] - previous[1]
-    if total_delta <= 0 or idle_delta < 0:
-        return None
-    return max(0.0, min(100.0, 100.0 * (1 - idle_delta / total_delta)))
-
-
-def parse_free(text: str) -> dict[str, int]:
-    """Saída de ``free -m`` → total/used/available (+ swap).
-
-    Suporta o procps moderno (coluna ``available``) e o antigo (linha
-    ``-/+ buffers/cache``, ex.: CentOS 6).
-    """
-    result: dict[str, int] = {}
-    header: list[str] = ["total", "used", "free"]
-    for line in text.splitlines():
-        fields = line.split()
-        if not fields:
-            continue
-        if fields[0] == "total":
-            header = fields
-            continue
-        if fields[0] == "-/+":
-            numbers = [int(v) for v in fields[2:] if v.isdigit()]
-            if len(numbers) >= 2:
-                result["used"], result["available"] = numbers[0], numbers[1]
-            continue
-        label = fields[0].rstrip(":").lower()
-        try:
-            values = [int(v) for v in fields[1:]]
-        except ValueError:
-            continue
-        columns = dict(zip(header, values, strict=False))
-        if label == "mem":
-            result["total"] = columns.get("total", 0)
-            result["used"] = columns.get("used", 0)
-            if "available" in columns:
-                result["available"] = columns["available"]
-            else:
-                result["available"] = (columns.get("free", 0) + columns.get("buffers", 0)
-                                       + columns.get("cached", 0))
-        elif label == "swap":
-            result["swap_total"] = columns.get("total", 0)
-            result["swap_used"] = columns.get("used", 0)
-    return result
-
-
-_PSEUDO_FILESYSTEMS = {"tmpfs", "devtmpfs", "udev", "overlay", "shm", "none", "squashfs",
-                       "efivarfs", "proc", "sysfs", "cgroup", "cgroup2", "nsfs", "rootfs"}
-_IGNORED_MOUNT_PREFIXES = ("/dev", "/proc", "/sys", "/run", "/snap/", "/var/lib/docker/",
-                           "/var/snap/", "/boot/efi")
-
-
-def parse_df(text: str) -> list[DiskUsage]:
-    """Saída de ``df -kP`` (POSIX, blocos de 1 KiB), sem pseudo-sistemas de arquivos."""
-    disks: list[DiskUsage] = []
-    seen_mounts: set[str] = set()
-    for line in text.splitlines()[1:]:
-        fields = line.split()
-        if len(fields) < 6:
-            continue
-        filesystem = fields[0]
-        mount = " ".join(fields[5:])
-        if filesystem in _PSEUDO_FILESYSTEMS or mount.startswith(_IGNORED_MOUNT_PREFIXES):
-            continue
-        if filesystem.startswith("/dev/loop") or mount in seen_mounts:
-            continue
-        try:
-            size, used, avail = int(fields[1]), int(fields[2]), int(fields[3])
-            use_percent = float(fields[4].rstrip("%"))
-        except ValueError:
-            continue
-        if size <= 0:
-            continue
-        seen_mounts.add(mount)
-        disks.append(DiskUsage(filesystem, mount, size, used, avail, use_percent))
-    return disks
-
-
-def parse_metrics(output: str, previous_cpu: tuple[int, int] | None) -> tuple[HostMetrics, tuple[int, int] | None]:
-    """Interpreta a saída de :func:`build_metrics_command`.
-
-    Retorna as métricas e a última amostra de CPU (para o próximo delta).
-    """
-    sections = [s.strip("\n") for s in output.split(_SECTION)]
-    sections += [""] * (6 - len(sections))
-    uptime_s, load_s, nproc_s, cpu_s, free_s, df_s = sections[:6]
-
-    samples = parse_cpu_samples(cpu_s)
-    cpu_pct = None
-    if len(samples) >= 2:
-        cpu_pct = cpu_percent_between(samples[-2], samples[-1])
-    elif samples and previous_cpu is not None:
-        cpu_pct = cpu_percent_between(previous_cpu, samples[-1])
-    last_sample = samples[-1] if samples else previous_cpu
-
-    memory = parse_free(free_s)
-    metrics = HostMetrics(
-        uptime_seconds=parse_uptime(uptime_s),
-        load_avg=parse_loadavg(load_s),
-        cpu_count=parse_cpu_count(nproc_s),
-        cpu_percent=cpu_pct,
-        mem_total_mb=memory.get("total"),
-        mem_used_mb=memory.get("used"),
-        mem_available_mb=memory.get("available"),
-        swap_total_mb=memory.get("swap_total"),
-        swap_used_mb=memory.get("swap_used"),
-        disks=tuple(parse_df(df_s)),
-    )
-    return metrics, last_sample
-
-
-_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
-
-
-def strip_ansi(text: str) -> str:
-    return _ANSI_RE.sub("", text)
-
-
-def describe_sudo_failure(output: str) -> str | None:
-    lower = output.lower()
-    if "a password is required" in lower or "a terminal is required" in lower:
-        return ("O sudo exigiu senha. Libere o comando com NOPASSWD no sudoers "
-                "(veja docs/sudoers.example) — o monitor nunca envia senhas ao sudo.")
-    if "not in the sudoers file" in lower or "is not allowed to execute" in lower:
-        return "O usuário SSH não tem permissão no sudoers para este comando."
-    if "interactive authentication required" in lower or "access denied" in lower:
-        return ("O systemd/polkit negou a operação. Habilite \"use_sudo\" e configure o "
-                "sudoers com NOPASSWD para os comandos permitidos.")
-    return None
-
-
-# ---------------------------------------------------------------------------
-# 4. Cliente SSH
+# Cliente
 # ---------------------------------------------------------------------------
 
 class SSHClient:
@@ -549,9 +124,13 @@ class SSHClient:
         self.connect_timeout = float(connect_timeout)
         self.known_hosts_file = known_hosts_file
         self._lock = threading.RLock()
+        self._state_lock = threading.Lock()
         self._client: paramiko.SSHClient | None = None
         self._systemctl_json: bool | None = None
-        self._prev_cpu: tuple[int, int] | None = None
+        self._cgroup_v2: bool | None = None
+        self._metrics_state: parsers.MetricsState | None = None
+        self._process_sample: parsers.ProcessSample | None = None
+        self._cgroup_sample: parsers.CgroupSample | None = None
 
     # -- conexão ----------------------------------------------------------
 
@@ -561,9 +140,8 @@ class SSHClient:
         transport = client.get_transport() if client is not None else None
         return bool(transport and transport.is_active() and transport.is_authenticated())
 
-    @property
-    def _is_root(self) -> bool:
-        return self.server.username == "root"
+    def _sudo(self, enabled: bool) -> bool:
+        return enabled and self.server.username != "root"
 
     def connect(self) -> None:
         with self._lock:
@@ -630,7 +208,10 @@ class SSHClient:
             if transport is not None:
                 transport.set_keepalive(KEEPALIVE_SECONDS)
             self._client = client
-            self._prev_cpu = None
+            with self._state_lock:
+                self._metrics_state = None
+                self._process_sample = None
+                self._cgroup_sample = None
             log.info("[%s] conectado a %s", server.name, server.address)
 
     def close(self) -> None:
@@ -672,7 +253,7 @@ class SSHClient:
         try:
             try:
                 channel = transport.open_session(timeout=timeout)
-                channel.exec_command(wrap_remote_command(command))
+                channel.exec_command(cmd.wrap_remote_command(command))
                 channel.shutdown_write()  # EOF no stdin: nada fica esperando entrada
             except (paramiko.SSHException, OSError, EOFError) as exc:
                 if time.monotonic() >= deadline:
@@ -693,7 +274,7 @@ class SSHClient:
                 if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
                     break
                 if time.monotonic() >= deadline:
-                    raise SSHCommandTimeout(f"Comando excedeu {timeout:g}s: {command}")
+                    raise SSHCommandTimeout(f"Comando excedeu {timeout:g}s: {_short(command)}")
                 if not transport.is_active():
                     raise SSHConnectionError("Conexão SSH perdida durante o comando")
                 if not progressed:
@@ -714,85 +295,223 @@ class SSHClient:
             stderr=stderr.decode("utf-8", errors="replace"),
             duration=time.monotonic() - started,
         )
-        log.debug("[%s] %s → %s em %.2fs", self.server.name, command, exit_code, result.duration)
+        log.debug("[%s] %s → %s em %.2fs", self.server.name, _short(command), exit_code, result.duration)
         return result
 
     def _abort_transport(self, transport: paramiko.Transport, command: str) -> None:
-        log.warning("[%s] watchdog: servidor não respondeu a %r; derrubando conexão", self.server.name, command)
+        log.warning("[%s] watchdog: servidor não respondeu a %r; derrubando conexão",
+                    self.server.name, _short(command))
         try:
             transport.close()
         except Exception:  # noqa: BLE001
             pass
 
-    # -- coleta -----------------------------------------------------------
+    # -- systemd ----------------------------------------------------------
 
-    def list_services(self) -> list[ServiceInfo]:
+    def list_units(self) -> list[ServiceInfo]:
+        types = self.server.unit_types or SYSTEMD_UNIT_TYPES
         if self._systemctl_json is not False:
-            result = self.run(SYSTEMCTL_JSON_CMD)
+            result = self.run(cmd.build_list_units_command(types, json_output=True))
             if result.ok and result.stdout.lstrip().startswith("["):
                 try:
-                    services = parse_systemctl_json(result.stdout)
+                    units = parsers.parse_systemctl_json(result.stdout)
                 except ValueError:
                     log.info("[%s] JSON do systemctl inválido; usando saída tabular", self.server.name)
                 else:
                     self._systemctl_json = True
-                    return services
+                    return units
             elif not result.ok and not re.search(r"unrecognized|invalid|unknown|json", result.stderr, re.I):
                 # systemd presente mas inoperante (ex.: "System has not been booted with systemd").
                 raise SSHCommandError(f"systemctl indisponível: {result.output or result.exit_code}", result)
             # systemd antigo: ignora ou rejeita --output=json em list-units.
             log.info("[%s] systemctl sem suporte a JSON; usando saída tabular", self.server.name)
             self._systemctl_json = False
-        result = self.run(SYSTEMCTL_TABLE_CMD)
+        result = self.run(cmd.build_list_units_command(types, json_output=False))
         if not result.ok:
             raise SSHCommandError(f"systemctl indisponível: {result.output or result.exit_code}", result)
-        return parse_systemctl_table(result.stdout)
+        return parsers.parse_systemctl_table(result.stdout)
 
-    def list_containers(self) -> DockerResult:
-        if self.server.docker == "off":
-            return DockerResult(DockerState.DISABLED)
-        result = self.run(build_docker_ps_command(self.server.docker_sudo and not self._is_root))
-        if result.ok:
-            return DockerResult(DockerState.OK, tuple(parse_docker_ps(result.stdout)))
-        state, message = classify_docker_error(result)
-        return DockerResult(state, (), message)
+    def service_resources(self) -> dict[str, tuple[float | None, int | None]]:
+        """CPU/memória por serviço via cgroup v2 (vazio em cgroup v1)."""
+        if self._cgroup_v2 is False:
+            return {}
+        result = self.run(cmd.CGROUP_SERVICES_CMD)
+        with self._state_lock:
+            resources, self._cgroup_sample = parsers.parse_cgroup_services(result.stdout, self._cgroup_sample)
+        if self._cgroup_v2 is None:
+            self._cgroup_v2 = bool(resources)
+            if not resources:
+                log.info("[%s] cgroup v2 indisponível: sem CPU/memória por serviço", self.server.name)
+        return resources
+
+    def timers(self) -> list[TimerInfo]:
+        return parsers.parse_timers(self.run(cmd.TIMERS_CMD).stdout)
+
+    # -- runtimes -----------------------------------------------------------
+
+    def list_containers(self, runtime: ServiceKind) -> RuntimeResult:
+        mode, use_sudo = self._runtime_config(runtime)
+        if mode == "off":
+            return RuntimeResult(runtime, RuntimeState.DISABLED)
+        result = self.run(cmd.build_container_ps_command(runtime.value, use_sudo))
+        if not result.ok:
+            return RuntimeResult(runtime, *parsers.classify_runtime_error(runtime, result.exit_code, result.output))
+        parse: Callable[[str], list[ServiceInfo]] = (
+            parsers.parse_podman_ps if runtime is ServiceKind.PODMAN else parsers.parse_docker_ps)
+        try:
+            return RuntimeResult(runtime, RuntimeState.OK, tuple(parse(result.stdout)))
+        except ValueError as exc:
+            return RuntimeResult(runtime, RuntimeState.ERROR, (), f"Saída inesperada do {runtime.label}: {exc}")
+
+    def container_stats(self, runtime: ServiceKind) -> dict[str, tuple[float | None, int | None]]:
+        _mode, use_sudo = self._runtime_config(runtime)
+        result = self.run(cmd.build_container_stats_command(runtime.value, use_sudo))
+        # Aproveita a saída mesmo com código ≠ 0 (um contêiner pode sumir no meio da coleta).
+        return parsers.parse_container_stats(result.stdout)
+
+    def list_pods(self) -> RuntimeResult:
+        kind = ServiceKind.KUBERNETES
+        if self.server.kubernetes == "off":
+            return RuntimeResult(kind, RuntimeState.DISABLED)
+        result = self.run(cmd.build_pods_command(self.server.kubectl_command, self._sudo(self.server.kubectl_sudo)))
+        if not result.ok:
+            return RuntimeResult(kind, *parsers.classify_runtime_error(kind, result.exit_code, result.output))
+        return RuntimeResult(kind, RuntimeState.OK, tuple(parsers.parse_pods(result.stdout)))
+
+    def list_vms(self) -> RuntimeResult:
+        kind = ServiceKind.LIBVIRT
+        if self.server.libvirt == "off":
+            return RuntimeResult(kind, RuntimeState.DISABLED)
+        result = self.run(cmd.build_vm_list_command(self.server.libvirt_uri, self._sudo(self.server.libvirt_sudo)))
+        if not result.ok:
+            return RuntimeResult(kind, *parsers.classify_runtime_error(kind, result.exit_code, result.output))
+        return RuntimeResult(kind, RuntimeState.OK, tuple(parsers.parse_virsh_list(result.stdout)))
+
+    def _runtime_config(self, runtime: ServiceKind) -> tuple[str, bool]:
+        if runtime is ServiceKind.PODMAN:
+            return self.server.podman, self._sudo(self.server.podman_sudo)
+        return self.server.docker, self._sudo(self.server.docker_sudo)
+
+    # -- host ---------------------------------------------------------------
 
     def host_metrics(self) -> HostMetrics:
-        result = self.run(build_metrics_command(sample_cpu_twice=self._prev_cpu is None))
-        metrics, self._prev_cpu = parse_metrics(result.stdout, self._prev_cpu)
+        with self._state_lock:
+            first = self._metrics_state is None or self._metrics_state.cpu is None
+        result = self.run(cmd.build_metrics_command(sample_cpu_twice=first))
+        with self._state_lock:
+            metrics, self._metrics_state = parsers.parse_metrics(result.stdout, self._metrics_state)
         return metrics
 
-    # -- ações ------------------------------------------------------------
+    def processes(self) -> list[ProcessInfo]:
+        with self._state_lock:
+            first = self._process_sample is None
+        result = self.run(cmd.build_processes_command(sample_twice=first))
+        with self._state_lock:
+            processes, self._process_sample = parsers.parse_processes(result.stdout, self._process_sample)
+        return processes
+
+    def network(self) -> NetworkInfo:
+        result = self.run(cmd.build_ports_command(self._sudo(self.server.network_sudo)))
+        return parsers.parse_ports(result.stdout)
+
+    def cron(self) -> list[CronEntry]:
+        return parsers.parse_cron(self.run(cmd.CRON_CMD).stdout, self.server.username)
+
+    def journal_events(self, priority: str, limit: int, since_hours: int) -> list[JournalEntry]:
+        return parsers.parse_journal_json(self.run(cmd.build_events_command(priority, limit, since_hours)).stdout)
+
+    def system_info(self) -> tuple[SystemInfo, dict[str, float]]:
+        return parsers.parse_system_info(self.run(cmd.SYSTEM_INFO_CMD).stdout)
+
+    def ssh_failed_logins(self) -> int | None:
+        """Falhas de login SSH nas últimas 24 h (requer acesso ao journal)."""
+        text = self.run(cmd.SSH_FAILURES_CMD).stdout.strip()
+        return int(text) if text.isdigit() else None
+
+    def updates(self) -> UpdatesInfo | None:
+        return parsers.parse_updates(self.run(cmd.UPDATES_CMD).stdout)
+
+    # -- ações --------------------------------------------------------------
 
     def service_action(self, service: ServiceInfo, action: ServiceAction) -> ActionResult:
-        if service.kind is ServiceKind.DOCKER:
-            command = build_docker_action_command(service.name, action, self.server.docker_sudo and not self._is_root)
+        if not service.supports(action):
+            return ActionResult(ActionOutcome.ERROR, f"'{action.label}' não se aplica a {service.type_label}.")
+        server = self.server
+        if service.kind is ServiceKind.SYSTEMD:
+            command = cmd.build_unit_action_command(service.name, action, self._sudo(server.use_sudo))
+        elif service.kind.is_container:
+            _mode, use_sudo = self._runtime_config(service.kind)
+            command = cmd.build_container_action_command(service.kind.value, [service.name], action, use_sudo)
+        elif service.kind is ServiceKind.KUBERNETES:
+            command = cmd.build_pod_restart_command(server.kubectl_command, service.name,
+                                                    self._sudo(server.kubectl_sudo))
         else:
-            command = build_service_action_command(service.name, action, self.server.use_sudo and not self._is_root)
+            command = cmd.build_vm_action_command(server.libvirt_uri, service.name, action,
+                                                  self._sudo(server.libvirt_sudo))
+        return self._run_action(command, action.label, service.name)
+
+    def stack_action(self, stack: Stack, action: ServiceAction) -> ActionResult:
+        if not stack.kind.is_container:
+            return ActionResult(ActionOutcome.ERROR, "Ações em lote só existem para stacks de contêineres.")
+        _mode, use_sudo = self._runtime_config(stack.kind)
+        names = [member.name for member in stack.members]
+        command = cmd.build_container_action_command(stack.kind.value, names, action, use_sudo)
+        return self._run_action(command, action.label, f"stack {stack.name} ({len(names)} contêineres)")
+
+    def kill_process(self, pid: int, force: bool) -> ActionResult:
+        if not self.server.process_actions:
+            return ActionResult(ActionOutcome.ERROR, "Ações em processos estão desativadas (process_actions).")
+        command = cmd.build_kill_command(pid, force, self._sudo(self.server.process_sudo))
+        return self._run_action(command, "Forçar encerramento" if force else "Encerrar", f"PID {pid}")
+
+    def _run_action(self, command: str, label: str, target: str) -> ActionResult:
         try:
             result = self.run(command)
         except SSHCommandTimeout:
-            return ActionResult(
-                ActionOutcome.PENDING,
-                f"'{action.label}' em {service.name} ainda em andamento após {self.command_timeout:g}s; "
-                "acompanhe o status na tabela.",
-            )
+            return ActionResult(ActionOutcome.PENDING,
+                                f"'{label}' em {target} ainda em andamento após {self.command_timeout:g}s; "
+                                "acompanhe o status na tabela.")
         if result.ok:
-            verb = {"start": "Início", "stop": "Parada", "restart": "Reinício"}[action.value]
-            return ActionResult(ActionOutcome.OK, f"{verb} de {service.name} solicitado com sucesso.")
-        hint = describe_sudo_failure(result.output)
+            return ActionResult(ActionOutcome.OK, f"{label}: {target} — solicitado com sucesso.")
+        hint = parsers.describe_sudo_failure(result.output)
         detail = hint or result.output or f"código de saída {result.exit_code}"
-        return ActionResult(ActionOutcome.ERROR, f"Falha ao {action.label.lower()} {service.name}: {detail}")
+        return ActionResult(ActionOutcome.ERROR, f"Falha em '{label}' ({target}): {detail}")
+
+    # -- logs / detalhes ----------------------------------------------------
+
+    def logs_command(self, service: ServiceInfo, lines: int) -> str:
+        server = self.server
+        if service.kind is ServiceKind.SYSTEMD:
+            return cmd.build_journal_command(service.name, lines, self._sudo(server.logs_sudo))
+        if service.kind.is_container:
+            _mode, use_sudo = self._runtime_config(service.kind)
+            return cmd.build_container_logs_command(service.kind.value, service.name, lines, use_sudo)
+        if service.kind is ServiceKind.KUBERNETES:
+            return cmd.build_pod_logs_command(server.kubectl_command, service.name, lines,
+                                              self._sudo(server.kubectl_sudo))
+        return cmd.build_vm_info_command(server.libvirt_uri, service.name, self._sudo(server.libvirt_sudo))
 
     def service_logs(self, service: ServiceInfo, lines: int) -> str:
-        if service.kind is ServiceKind.DOCKER:
-            command = build_docker_logs_command(service.name, lines, self.server.docker_sudo and not self._is_root)
-        else:
-            command = build_journal_command(service.name, lines, self.server.logs_sudo and not self._is_root)
+        return self._text_output(self.logs_command(service, lines))
+
+    def stack_logs(self, stack: Stack, lines: int) -> str:
+        if not stack.kind.is_container:
+            return "\n\n".join(f"===== {m.name} =====\n{self.service_logs(m, lines)}" for m in stack.members[:10])
+        _mode, use_sudo = self._runtime_config(stack.kind)
+        per_container = max(10, lines // max(1, len(stack.members)))
+        command = cmd.build_stack_logs_command(stack.kind.value, [m.name for m in stack.members],
+                                               per_container, use_sudo)
+        return self._text_output(command)
+
+    def _text_output(self, command: str) -> str:
         result = self.run(command)
-        text = strip_ansi(result.stdout if service.kind is ServiceKind.DOCKER else result.output).rstrip()
+        text = parsers.strip_ansi(result.output).rstrip()
         if not result.ok:
-            hint = describe_sudo_failure(result.output)
+            hint = parsers.describe_sudo_failure(result.output)
             prefix = f"[código de saída {result.exit_code}]"
             return f"{prefix} {hint}\n\n{text}" if hint else f"{prefix}\n{text}"
         return text or "(sem entradas de log)"
+
+
+def _short(command: str, limit: int = 120) -> str:
+    return command if len(command) <= limit else command[: limit - 1] + "…"

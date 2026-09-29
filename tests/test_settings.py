@@ -123,3 +123,51 @@ def test_find_config_order(tmp_path, monkeypatch):
     assert find_config(explicit) == explicit
     monkeypatch.setenv("FIRAWYNIX_CONFIG", str(explicit))
     assert find_config() == explicit
+
+
+def test_new_runtime_and_collection_options():
+    config = parse_config({
+        "settings": {
+            "detail_interval_seconds": 20, "inventory_interval_seconds": 120, "process_limit": 50,
+            "history": {"enabled": True, "retention_days": 30, "file": "hist.sqlite3"},
+            "thresholds": {"cpu_percent": 95, "mem_percent": 0, "disk_percent": 85, "sustain_polls": 5},
+            "events": {"priority": "warning", "limit": 200, "since_hours": 48},
+        },
+        **_minimal(podman=True, kubernetes="on", kubectl_command="k3s kubectl", kubectl_sudo=True,
+                   libvirt="off", libvirt_uri="qemu+ssh://root@hv/system", network_sudo=True,
+                   process_actions=True, unit_types=["service", "timer"]),
+    })
+    settings, server = config.settings, config.servers[0]
+    assert settings.detail_interval_seconds == 20 and settings.process_limit == 50
+    assert settings.history.retention_days == 30 and settings.history.file.name == "hist.sqlite3"
+    assert settings.thresholds.mem_percent == 0 and settings.thresholds.sustain_polls == 5
+    assert settings.events.priority == "warning" and settings.events.since_hours == 48
+    assert (server.podman, server.kubernetes, server.libvirt) == ("on", "on", "off")
+    assert server.kubectl_command == "k3s kubectl" and server.kubectl_sudo
+    assert server.process_actions and server.network_sudo
+    assert server.unit_types == ("service", "timer")
+
+
+def test_defaults_for_new_options():
+    server = parse_config(_minimal()).servers[0]
+    assert (server.podman, server.kubernetes, server.libvirt) == ("auto", "auto", "auto")
+    assert server.process_actions is False and server.unit_types[0] == "service"
+
+
+@pytest.mark.parametrize(("overrides", "fragment"), [
+    ({"kubectl_command": "kubectl; rm -rf /"}, "kubectl_command"),
+    ({"libvirt_uri": "qemu:///system && id"}, "libvirt_uri"),
+    ({"unit_types": ["service", "target"]}, "unit_types"),
+    ({"podman": "sometimes"}, "podman"),
+])
+def test_invalid_new_options(overrides, fragment):
+    with pytest.raises(ConfigError, match=fragment):
+        parse_config(_minimal(**overrides))
+
+
+def test_invalid_nested_settings():
+    with pytest.raises(ConfigError) as err:
+        parse_config({"settings": {"thresholds": {"cpu_percent": 150, "bogus": 1}, "events": {"priority": "x"}},
+                      **_minimal()})
+    message = str(err.value)
+    assert "cpu_percent" in message and "bogus" in message and "priority" in message

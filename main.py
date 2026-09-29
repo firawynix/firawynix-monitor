@@ -80,6 +80,18 @@ def acquire_single_instance():
     return handle
 
 
+def open_history(settings, *, demo: bool):
+    """Histórico em SQLite (em memória no modo demo, para não misturar dados)."""
+    if not settings.history.enabled:
+        return None
+    from core.history import HistoryStore
+
+    path = None if demo else (settings.history.file or user_data_dir() / "history.sqlite3")
+    store = HistoryStore(path, retention_days=settings.history.retention_days)
+    log.info("Histórico: %s (retenção de %g dias)", path or "memória", settings.history.retention_days)
+    return store
+
+
 def show_fatal(title: str, message: str) -> None:
     log.error("%s: %s", title, message)
     try:
@@ -138,16 +150,24 @@ def main(argv: list[str] | None = None) -> int:
     ctk.set_appearance_mode(settings.appearance_mode)
     ctk.set_default_color_theme("blue")
 
+    history = open_history(settings, demo=args.demo)
+    if args.demo and history is not None:
+        from core.demo import seed_demo_history
+
+        seed_demo_history(history, app_config)
+
     notifier = Notifier(settings.notifications, icon_path=icon_png)
-    manager = MonitorManager(app_config, client_factory=client_factory)
+    manager = MonitorManager(app_config, client_factory=client_factory, history=history)
     tray: TrayIcon | None = None
 
     def shutdown() -> None:
         manager.stop()
         if tray is not None:
             tray.stop()
+        if history is not None:
+            history.close()
 
-    app = Dashboard(app_config, manager, notifier, icon_path=icon_ico, on_quit=shutdown)
+    app = Dashboard(app_config, manager, notifier, history=history, icon_path=icon_ico, on_quit=shutdown)
     if args.demo:
         app.title(f"{APP_TITLE} — DEMONSTRAÇÃO")
 

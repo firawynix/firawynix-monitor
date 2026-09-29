@@ -1,12 +1,12 @@
 """Testes do loop de monitoramento com um cliente falso (sem rede)."""
 
 import queue
-import threading
 import time
 
 import pytest
 
-from config.settings import AppSettings, Config, NotificationSettings, ServerConfig
+from config.settings import AppSettings, Config, NotificationSettings, ServerConfig, ThresholdSettings
+from core.history import HistoryStore
 from core.models import (
     ActionOutcome,
     ActionResult,
@@ -14,17 +14,23 @@ from core.models import (
     AlertKind,
     ConnectionEvent,
     ConnectionState,
-    DockerResult,
-    DockerState,
+    DiskUsage,
     HostMetrics,
+    NetworkInfo,
+    ProcessInfo,
+    RuntimeResult,
+    RuntimeState,
     ServiceAction,
     ServiceAlertEvent,
     ServiceInfo,
     ServiceKind,
     ServiceStatus,
     SnapshotEvent,
+    Stack,
+    SystemInfo,
+    ThresholdAlertEvent,
 )
-from core.monitor import AlertPolicy, ExponentialBackoff, MonitorManager, matches_patterns
+from core.monitor import AlertPolicy, ExponentialBackoff, MonitorManager, ThresholdPolicy, matches_patterns
 from core.ssh_client import SSHCommandTimeout, SSHConnectionError
 
 
@@ -56,6 +62,12 @@ def test_exponential_backoff_jitter_stays_in_range():
     (svc("nginx.service"), ["docker:nginx"], False),
     (svc("web", kind=ServiceKind.DOCKER), ["docker:web*"], True),
     (svc("web", kind=ServiceKind.DOCKER), ["systemd:*"], False),
+    (svc("db", kind=ServiceKind.PODMAN), ["podman:db"], True),
+    (svc("prod/api-1", kind=ServiceKind.KUBERNETES), ["k8s:prod/*"], True),
+    (svc("prod/api-1", kind=ServiceKind.KUBERNETES), ["kubernetes:prod/*"], True),
+    (svc("dev/api-1", kind=ServiceKind.KUBERNETES), ["k8s:prod/*"], False),
+    (svc("win-ad", kind=ServiceKind.LIBVIRT), ["vm:win*"], True),
+    (svc("apt-daily.timer"), ["*.timer"], True),
     (svc("cron.service"), ["*"], True),
     (svc("cron.service"), [], False),
 ])
@@ -64,7 +76,7 @@ def test_matches_patterns(service, patterns, expected):
 
 
 # ---------------------------------------------------------------------------
-# Política de alertas
+# Políticas de alerta
 # ---------------------------------------------------------------------------
 
 def _evaluate(policy, previous, current):
@@ -99,6 +111,37 @@ def test_alert_on_stop_skips_user_requested_stops():
     assert _evaluate(AlertPolicy(NotificationSettings()), running, stopped) == []
 
 
+def _metrics(cpu=10.0, mem_used=1000, disks=(("/", 50.0),)):
+    return HostMetrics(cpu_percent=cpu, mem_total_mb=10_000, mem_used_mb=mem_used,
+                       disks=tuple(DiskUsage("/dev/x", m, 100, 50, 50, p) for m, p in disks))
+
+
+def _thresholds(policy, metrics):
+    return [(e.metric, e.recovered) for e in policy.evaluate("srv", metrics)]
+
+
+def test_threshold_policy_sustain_hysteresis_and_disk():
+    policy = ThresholdPolicy(ThresholdSettings(cpu_percent=90, mem_percent=90, disk_percent=90, sustain_polls=3))
+    assert _thresholds(policy, _metrics(cpu=95)) == []
+    assert _thresholds(policy, _metrics(cpu=95)) == []
+    assert _thresholds(policy, _metrics(cpu=95)) == [("cpu", False)]
+    assert policy.active == ("CPU 95%",)
+    assert _thresholds(policy, _metrics(cpu=96)) == []  # já alertado
+    assert _thresholds(policy, _metrics(cpu=87)) == []  # histerese: ainda acima de 85
+    assert _thresholds(policy, _metrics(cpu=80)) == [("cpu", True)]
+    assert policy.active == ()
+    # Disco alerta na primeira leitura; montagem que some limpa o estado.
+    assert _thresholds(policy, _metrics(disks=(("/", 50.0), ("/data", 97.0)))) == [("disk:/data", False)]
+    assert policy.active == ("Disco /data 97%",)
+    assert _thresholds(policy, _metrics(disks=(("/", 50.0),))) == []
+    assert policy.active == ()
+
+
+def test_threshold_zero_disables():
+    policy = ThresholdPolicy(ThresholdSettings(cpu_percent=0, mem_percent=0, disk_percent=0, sustain_polls=1))
+    assert _thresholds(policy, _metrics(cpu=100, mem_used=10_000, disks=(("/", 100.0),))) == []
+
+
 # ---------------------------------------------------------------------------
 # Loop do monitor
 # ---------------------------------------------------------------------------
@@ -106,18 +149,23 @@ def test_alert_on_stop_skips_user_requested_stops():
 class FakeClient:
     """Cliente programável: listas de exceções/valores consumidas a cada chamada."""
 
-    def __init__(self, *, connect_errors=0, service_errors=()):
+    def __init__(self, *, connect_errors=0, unit_errors=(), docker_state=RuntimeState.NOT_INSTALLED):
         self._connected = False
         self.connect_errors = connect_errors
-        self.service_errors = list(service_errors)
+        self.unit_errors = list(unit_errors)
         self.connect_calls = 0
-        self.services = [
+        self.calls: dict[str, int] = {}
+        self.docker_state = docker_state
+        self.units = [
             ServiceInfo(ServiceKind.SYSTEMD, "nginx.service", "", ServiceStatus.ACTIVE, "active", "running"),
             ServiceInfo(ServiceKind.SYSTEMD, "app.service", "", ServiceStatus.FAILED, "failed", "failed"),
             ServiceInfo(ServiceKind.SYSTEMD, "noise.service", "", ServiceStatus.FAILED, "failed", "failed"),
         ]
+        self.cpu = 10.0
         self.actions = []
-        self.lock = threading.Lock()
+
+    def _count(self, name):
+        self.calls[name] = self.calls.get(name, 0) + 1
 
     @property
     def connected(self):
@@ -133,32 +181,97 @@ class FakeClient:
     def close(self):
         self._connected = False
 
-    def list_services(self):
-        if self.service_errors:
-            error = self.service_errors.pop(0)
+    def list_units(self):
+        self._count("units")
+        if self.unit_errors:
+            error = self.unit_errors.pop(0)
             if isinstance(error, SSHConnectionError):
                 self._connected = False
             raise error
-        return list(self.services)
+        return list(self.units)
 
-    def list_containers(self):
-        return DockerResult(DockerState.NOT_INSTALLED, (), "Docker não instalado neste host.")
+    def service_resources(self):
+        return {"nginx.service": (1.5, 50 * 1024 ** 2)}
+
+    def list_containers(self, runtime):
+        self._count(runtime.value)
+        if runtime is ServiceKind.DOCKER and self.docker_state is RuntimeState.OK:
+            web = ServiceInfo(ServiceKind.DOCKER, "shop-web-1", "nginx", ServiceStatus.ACTIVE, "running", "Up",
+                              group="shop")
+            return RuntimeResult(runtime, RuntimeState.OK, (web,))
+        return RuntimeResult(runtime, self.docker_state if runtime is ServiceKind.DOCKER
+                             else RuntimeState.NOT_INSTALLED, (), f"{runtime.label} indisponível")
+
+    def container_stats(self, runtime):
+        self._count("stats")
+        return {"shop-web-1": (12.5, 100 * 1024 ** 2)}
+
+    def list_pods(self):
+        self._count("k8s")
+        return RuntimeResult(ServiceKind.KUBERNETES, RuntimeState.NOT_INSTALLED)
+
+    def list_vms(self):
+        return RuntimeResult(ServiceKind.LIBVIRT, RuntimeState.NOT_INSTALLED)
 
     def host_metrics(self):
-        return HostMetrics(cpu_percent=12.0)
+        return HostMetrics(cpu_percent=self.cpu, mem_total_mb=1000, mem_used_mb=100,
+                           disks=(DiskUsage("/dev/sda1", "/", 100, 10, 90, 10.0),))
+
+    def processes(self):
+        self._count("processes")
+        return [ProcessInfo(i, "root", 1.0, 0.1, 100, 10, "S", f"p{i}", f"p{i}") for i in range(5)]
+
+    def network(self):
+        return NetworkInfo(tcp_inuse=3)
+
+    def timers(self):
+        return []
+
+    def cron(self):
+        return []
+
+    def journal_events(self, priority, limit, since_hours):
+        self._count("events")
+        return []
+
+    def system_info(self):
+        self._count("system")
+        return SystemInfo(hostname="fake", journal_access=True), {"/": 42.0}
+
+    def ssh_failed_logins(self):
+        return 5
+
+    def updates(self):
+        self._count("updates")
+        return None
 
     def service_action(self, service, action):
         self.actions.append((service.name, action))
         return ActionResult(ActionOutcome.OK, "ok")
 
+    def stack_action(self, stack, action):
+        self.actions.append((stack.name, action))
+        return ActionResult(ActionOutcome.OK, "ok")
+
+    def kill_process(self, pid, force):
+        self.actions.append((pid, force))
+        return ActionResult(ActionOutcome.OK, "ok")
+
+    def logs_command(self, service, lines):
+        return f"logs {service.name}"
+
     def service_logs(self, service, lines):
         return f"{lines} linhas de {service.name}"
 
+    def stack_logs(self, stack, lines):
+        return f"stack {stack.name}"
 
-def _manager(client, **server_kwargs):
+
+def _manager(client, settings=None, history=None, **server_kwargs):
     server = ServerConfig(name="srv", host="h", username="u", **server_kwargs)
-    config = Config(settings=AppSettings(poll_interval_seconds=2.0), servers=(server,))
-    manager = MonitorManager(config, client_factory=lambda _s, _a: client)
+    settings = settings or AppSettings(poll_interval_seconds=2.0, process_limit=3)
+    config = Config(settings=settings, servers=(server,))
+    manager = MonitorManager(config, client_factory=lambda _s, _a: client, history=history)
     monitor = manager.monitors["srv"]
     monitor._backoff = ExponentialBackoff(base=0.01, maximum=0.05, jitter=0)
     monitor.interval = 0.05
@@ -183,7 +296,11 @@ def _count(events, cls, **attrs):
     return sum(1 for e in events if isinstance(e, cls) and all(getattr(e, k) == v for k, v in attrs.items()))
 
 
-def test_monitor_reconnects_with_backoff_then_emits_snapshot():
+def _snapshots(events):
+    return [e.snapshot for e in events if isinstance(e, SnapshotEvent)]
+
+
+def test_monitor_reconnects_with_backoff_then_emits_full_snapshot():
     client = FakeClient(connect_errors=2)
     manager = _manager(client, critical_services=("app*",), exclude_services=("noise*",))
     manager.start()
@@ -194,19 +311,53 @@ def test_monitor_reconnects_with_backoff_then_emits_snapshot():
     states = [e.state for e in events if isinstance(e, ConnectionEvent)]
     assert states[:4] == [ConnectionState.CONNECTING, ConnectionState.RECONNECTING,
                           ConnectionState.RECONNECTING, ConnectionState.CONNECTED]
-    retry = [e.retry_in for e in events if isinstance(e, ConnectionEvent) and e.retry_in]
-    assert retry == [0.01, 0.02]
-    snapshot = next(e.snapshot for e in events if isinstance(e, SnapshotEvent))
+    assert [e.retry_in for e in events if isinstance(e, ConnectionEvent) and e.retry_in] == [0.01, 0.02]
+    snapshot = _snapshots(events)[0]
     names = {s.name: s for s in snapshot.services}
     assert set(names) == {"nginx.service", "app.service"}  # noise.service excluído
     assert names["app.service"].critical and not names["nginx.service"].critical
-    assert snapshot.docker.state is DockerState.NOT_INSTALLED and snapshot.warnings == ()
+    assert names["nginx.service"].mem_bytes == 50 * 1024 ** 2  # recursos do cgroup mesclados
+    assert len(snapshot.processes) == 3  # process_limit
+    assert snapshot.metrics.disks[0].inode_percent == 42.0
+    assert snapshot.system.ssh_failed_logins_24h == 5
+    assert snapshot.warnings == ()  # runtimes ausentes em modo auto não geram aviso
     alerts = [e for e in events if isinstance(e, ServiceAlertEvent)]
     assert [(a.alert, a.service.name) for a in alerts] == [(AlertKind.FAILED, "app.service")]
 
 
+def test_monitor_collection_tiers_and_runtime_recheck():
+    client = FakeClient()
+    manager = _manager(client)
+    manager.start()
+    try:
+        _collect(manager, lambda ev: _count(ev, SnapshotEvent) >= 5)
+    finally:
+        manager.stop()
+    assert client.calls["units"] >= 5
+    assert client.calls["processes"] == 1  # detalhes: 15 s por padrão
+    assert client.calls["system"] == 1 and client.calls["events"] == 1  # inventário: 60 s
+    assert client.calls["updates"] == 1
+    assert client.calls["docker"] == 1 and client.calls["k8s"] == 1  # ausentes: re-teste só após 12 ciclos
+
+
+def test_monitor_merges_container_stats_and_warns_when_runtime_forced():
+    client = FakeClient(docker_state=RuntimeState.OK)
+    manager = _manager(client, podman="on")
+    manager.start()
+    try:
+        events = _collect(manager, lambda ev: any(
+            any(s.cpu_percent == 12.5 for s in snap.services) for snap in _snapshots(ev)))
+    finally:
+        manager.stop()
+    snapshot = _snapshots(events)[-1]
+    web = next(s for s in snapshot.services if s.name == "shop-web-1")
+    assert web.mem_bytes == 100 * 1024 ** 2
+    assert [st.name for st in snapshot.stacks()] == ["shop"]
+    assert "Podman indisponível" in snapshot.warnings  # modo "on" exige o runtime
+
+
 def test_monitor_recovers_from_connection_loss_during_collect():
-    client = FakeClient(service_errors=[SSHConnectionError("reset by peer")])
+    client = FakeClient(unit_errors=[SSHConnectionError("reset by peer")])
     manager = _manager(client)
     manager.start()
     try:
@@ -219,8 +370,7 @@ def test_monitor_recovers_from_connection_loss_during_collect():
 
 
 def test_monitor_keeps_stale_data_on_timeout_and_reconnects_after_three():
-    timeouts = [SSHCommandTimeout("lento")] * 3
-    client = FakeClient(service_errors=timeouts)
+    client = FakeClient(unit_errors=[SSHCommandTimeout("lento")] * 3)
     manager = _manager(client)
     manager.start()
     try:
@@ -228,23 +378,47 @@ def test_monitor_keeps_stale_data_on_timeout_and_reconnects_after_three():
                           and _count(ev, SnapshotEvent) >= 3)
     finally:
         manager.stop()
-    first = next(e.snapshot for e in events if isinstance(e, SnapshotEvent))
+    first = _snapshots(events)[0]
     assert any("não respondeu a tempo" in w for w in first.warnings)
     assert client.connect_calls >= 2
 
 
-def test_run_action_emits_result_and_fetch_logs():
+def test_monitor_records_history_and_emits_threshold_alerts():
     client = FakeClient()
-    manager = _manager(client)
+    client.cpu = 99.0
+    history = HistoryStore(None)
+    settings = AppSettings(poll_interval_seconds=2.0, thresholds=ThresholdSettings(sustain_polls=2))
+    manager = _manager(client, settings=settings, history=history)
+    manager.start()
+    try:
+        events = _collect(manager, lambda ev: _count(ev, ThresholdAlertEvent) >= 1)
+    finally:
+        manager.stop()
+    alert = next(e for e in events if isinstance(e, ThresholdAlertEvent))
+    assert (alert.metric, alert.value, alert.recovered) == ("cpu", 99.0, False)
+    series = history.query("srv", 3600)
+    assert len(series) >= 1 and series.values["cpu"][-1] == pytest.approx(99.0)
+
+
+def test_actions_emit_results_and_fetch_logs():
+    client = FakeClient()
+    manager = _manager(client, process_actions=True)
     manager.start()
     try:
         _collect(manager, lambda ev: _count(ev, SnapshotEvent) >= 1)
-        service = client.services[0]
+        service = client.units[0]
         result = manager.run_action("srv", service, ServiceAction.RESTART).result(timeout=5)
         assert result.outcome is ActionOutcome.OK
-        assert client.actions == [("nginx.service", ServiceAction.RESTART)]
-        _collect(manager, lambda ev: _count(ev, ActionResultEvent) >= 1)
+        stack = Stack("shop", ServiceKind.DOCKER, (svc("web", kind=ServiceKind.DOCKER),))
+        assert manager.run_stack_action("srv", stack, ServiceAction.STOP).result(timeout=5).outcome is ActionOutcome.OK
+        assert manager.kill_process("srv", 1234, True).result(timeout=5).outcome is ActionOutcome.OK
+        assert client.actions == [("nginx.service", ServiceAction.RESTART), ("shop", ServiceAction.STOP), (1234, True)]
+        events = _collect(manager, lambda ev: _count(ev, ActionResultEvent) >= 3)
+        keys = [e.busy_key for e in events if isinstance(e, ActionResultEvent)]
+        assert keys == ["systemd:nginx.service", "docker:shop", "pid:1234"]
         assert manager.fetch_logs("srv", service, 25).result(timeout=5) == "25 linhas de nginx.service"
+        assert manager.fetch_stack_logs("srv", stack, 25).result(timeout=5) == "stack shop"
+        assert manager.logs_command("srv", service, 10) == "logs nginx.service"
     finally:
         manager.stop()
 
@@ -252,9 +426,9 @@ def test_run_action_emits_result_and_fetch_logs():
 def test_run_action_when_disconnected_returns_error():
     client = FakeClient()
     manager = _manager(client)  # não iniciado: cliente nunca conectou
-    result = manager.run_action("srv", client.services[0], ServiceAction.STOP).result(timeout=5)
+    result = manager.run_action("srv", client.units[0], ServiceAction.STOP).result(timeout=5)
     assert result.outcome is ActionOutcome.ERROR
     assert "desconectado" in result.message
     with pytest.raises(SSHConnectionError):
-        manager.fetch_logs("srv", client.services[0], 10).result(timeout=5)
+        manager.fetch_logs("srv", client.units[0], 10).result(timeout=5)
     manager.stop()

@@ -3,23 +3,30 @@
 # Instale SEMPRE com o visudo (valida a sintaxe antes de salvar):
 #   sudo visudo -f /etc/sudoers.d/firawynix-monitor
 #
-# Confirme o caminho absoluto do systemctl no servidor e ajuste abaixo:
-#   command -v systemctl      # /usr/bin/systemctl (Debian 10+, Ubuntu, RHEL 8+) ou /bin/systemctl
+# Confirme os caminhos absolutos no servidor e ajuste abaixo:
+#   command -v systemctl docker podman kubectl k3s virsh ss kill
 #
 # O Firawynix Monitor executa EXATAMENTE estes comandos, sempre com "sudo -n"
 # (não interativo: se o sudoers exigir senha, a ação falha na hora e a
-# interface explica o motivo — o monitor nunca envia senha ao sudo):
+# interface explica o motivo — o monitor nunca envia senha ao sudo). Só é
+# necessário liberar os que você habilitar no servers.json:
 #
-#   systemctl --no-block start   <unidade>.service
-#   systemctl --no-block stop    <unidade>.service
-#   systemctl --no-block restart <unidade>.service
-#   journalctl -u <unidade>.service -n <N> --no-pager    (somente com "logs_sudo": true)
-#   docker start|stop -t 3|restart -t 3 <contêiner>      (somente com "docker_sudo": true)
+#   use_sudo      systemctl --no-block start|stop|restart <unidade>
+#   logs_sudo     journalctl -u <unidade> -n <N> --no-pager
+#   docker_sudo   docker ps -a --format ... | docker stats --no-stream --format ...
+#                 docker start|stop -t 3|restart -t 3 <contêiner> [<contêiner>...]
+#                 docker logs --tail <N> --timestamps <contêiner>
+#   podman_sudo   os mesmos comandos acima com "podman" (ps usa "--format json")
+#   kubectl_sudo  kubectl get pods -A ... | kubectl delete pod -n <ns> <pod> ...
+#                 kubectl logs -n <ns> <pod> ...   (ou "k3s kubectl ...")
+#   libvirt_sudo  virsh -c <uri> -q list --all | start|shutdown|reboot|dominfo <vm>
+#   network_sudo  ss -tulnp            (mostra o processo dono de cada porta)
+#   process_sudo  kill -TERM|-KILL <pid>
 #
 # O usuário "monitor" é apenas um exemplo: use o mesmo "username" do servers.json.
 
 # ---------------------------------------------------------------------------
-# Opção A (recomendada) — somente os serviços que podem ser controlados.
+# systemd — Opção A (recomendada): somente os serviços que podem ser controlados.
 # ---------------------------------------------------------------------------
 Cmnd_Alias FWX_NGINX = /usr/bin/systemctl --no-block start nginx.service, \
                        /usr/bin/systemctl --no-block stop nginx.service, \
@@ -31,10 +38,10 @@ Cmnd_Alias FWX_APP   = /usr/bin/systemctl --no-block restart gunicorn.service, \
 monitor ALL=(root) NOPASSWD: FWX_NGINX, FWX_APP
 
 # ---------------------------------------------------------------------------
-# Opção B — qualquer serviço (mais simples, menos restritiva).
+# systemd — Opção B: qualquer unidade (mais simples, menos restritiva).
 # Atenção: no sudoers o "*" casa com qualquer texto, inclusive argumentos
-# extras. O monitor valida o nome da unidade antes de executar, mas a regra
-# também vale para quem usar a mesma conta via SSH manualmente.
+# extras. O monitor valida o nome antes de executar, mas a regra também vale
+# para quem usar a mesma conta via SSH manualmente.
 # ---------------------------------------------------------------------------
 # Cmnd_Alias FWX_ANY = /usr/bin/systemctl --no-block start *, \
 #                      /usr/bin/systemctl --no-block stop *, \
@@ -42,7 +49,39 @@ monitor ALL=(root) NOPASSWD: FWX_NGINX, FWX_APP
 # monitor ALL=(root) NOPASSWD: FWX_ANY
 
 # ---------------------------------------------------------------------------
-# Logs e Docker SEM sudo (preferível):
-#   sudo usermod -aG systemd-journal monitor   # journalctl de todos os serviços
+# Portas com o processo dono (network_sudo: true) — somente leitura.
+# ---------------------------------------------------------------------------
+# monitor ALL=(root) NOPASSWD: /usr/bin/ss -tulnp
+
+# ---------------------------------------------------------------------------
+# k3s (kubectl_command: "k3s kubectl", kubectl_sudo: true). O kubeconfig do
+# k3s (/etc/rancher/k3s/k3s.yaml) só é legível pelo root.
+# ---------------------------------------------------------------------------
+# Cmnd_Alias FWX_K3S = /usr/local/bin/k3s kubectl get pods *, \
+#                      /usr/local/bin/k3s kubectl delete pod *, \
+#                      /usr/local/bin/k3s kubectl logs *
+# monitor ALL=(root) NOPASSWD: FWX_K3S
+
+# ---------------------------------------------------------------------------
+# libvirt: prefira o grupo "libvirt" (sudo usermod -aG libvirt monitor).
+# Com libvirt_sudo: true, libere apenas as VMs desejadas:
+# ---------------------------------------------------------------------------
+# Cmnd_Alias FWX_VM = /usr/bin/virsh -c qemu\:///system -q list --all, \
+#                     /usr/bin/virsh -c qemu\:///system start ci-runner, \
+#                     /usr/bin/virsh -c qemu\:///system shutdown ci-runner, \
+#                     /usr/bin/virsh -c qemu\:///system reboot ci-runner
+# monitor ALL=(root) NOPASSWD: FWX_VM
+
+# ---------------------------------------------------------------------------
+# NÃO recomendado: "kill" via sudo equivale a poder encerrar qualquer processo
+# (inclusive o sshd). Sem process_sudo, o monitor só encerra processos do
+# próprio usuário SSH — o que costuma bastar para workers e scripts.
+# ---------------------------------------------------------------------------
+# monitor ALL=(root) NOPASSWD: /usr/bin/kill -TERM *
+
+# ---------------------------------------------------------------------------
+# Sem sudo (preferível):
+#   sudo usermod -aG systemd-journal monitor   # logs e eventos de todos os serviços
 #   sudo usermod -aG docker monitor            # ATENÇÃO: grupo docker ≈ acesso root
+#   sudo usermod -aG libvirt monitor           # listar/controlar VMs
 # ---------------------------------------------------------------------------

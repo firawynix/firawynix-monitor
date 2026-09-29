@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from core.commands import validate_kubectl_command, validate_libvirt_uri
+
 log = logging.getLogger(__name__)
 
 APP_NAME = "FirawynixMonitor"
@@ -28,8 +30,10 @@ MIN_POLL_INTERVAL = 2.0
 MAX_POLL_INTERVAL = 3600.0
 
 HOST_KEY_POLICIES = ("accept-new", "strict")
-DOCKER_MODES = ("auto", "on", "off")
+RUNTIME_MODES = ("auto", "on", "off")
 APPEARANCE_MODES = ("dark", "light", "system")
+EVENT_PRIORITIES = ("emerg", "alert", "crit", "err", "warning", "notice")
+UNIT_TYPES = ("service", "timer", "socket", "mount", "path")
 
 
 class ConfigError(Exception):
@@ -48,16 +52,52 @@ class NotificationSettings:
 
 
 @dataclass(frozen=True)
+class HistorySettings:
+    enabled: bool = True
+    retention_days: float = 7.0
+    #: None = %LOCALAPPDATA%\FirawynixMonitor\history.sqlite3
+    file: Path | None = None
+
+
+@dataclass(frozen=True)
+class ThresholdSettings:
+    """Alertas de recursos do host. 0 desativa o limite."""
+
+    cpu_percent: float = 90.0
+    mem_percent: float = 90.0
+    disk_percent: float = 90.0
+    #: Coletas seguidas acima do limite antes de alertar (evita picos momentâneos).
+    sustain_polls: int = 3
+
+
+@dataclass(frozen=True)
+class EventSettings:
+    priority: str = "err"
+    limit: int = 100
+    since_hours: int = 24
+
+
+@dataclass(frozen=True)
 class AppSettings:
     poll_interval_seconds: float = 5.0
+    #: Processos, portas e estatísticas de contêineres.
+    detail_interval_seconds: float = 15.0
+    #: Inventário: sistema, timers, cron, eventos do journal.
+    inventory_interval_seconds: float = 60.0
+    #: Contagem de atualizações pendentes (somente cache local).
+    updates_interval_seconds: float = 1800.0
     command_timeout_seconds: float = MAX_COMMAND_TIMEOUT
     connect_timeout_seconds: float = 5.0
     minimize_to_tray: bool = True
     start_minimized: bool = False
     appearance_mode: str = "dark"
     log_lines: int = 50
+    process_limit: int = 200
     known_hosts_file: Path | None = None
     notifications: NotificationSettings = field(default_factory=NotificationSettings)
+    history: HistorySettings = field(default_factory=HistorySettings)
+    thresholds: ThresholdSettings = field(default_factory=ThresholdSettings)
+    events: EventSettings = field(default_factory=EventSettings)
 
 
 @dataclass(frozen=True)
@@ -75,7 +115,19 @@ class ServerConfig:
     use_sudo: bool = True
     docker: str = "auto"
     docker_sudo: bool = False
+    podman: str = "auto"
+    podman_sudo: bool = False
+    kubernetes: str = "auto"
+    kubectl_command: str = "kubectl"
+    kubectl_sudo: bool = False
+    libvirt: str = "auto"
+    libvirt_uri: str = "qemu:///system"
+    libvirt_sudo: bool = False
     logs_sudo: bool = False
+    network_sudo: bool = False
+    process_actions: bool = False
+    process_sudo: bool = False
+    unit_types: tuple[str, ...] = UNIT_TYPES
     poll_interval_seconds: float | None = None
     critical_services: tuple[str, ...] = ("*",)
     exclude_services: tuple[str, ...] = ()
@@ -235,10 +287,14 @@ def parse_config(raw: Any, *, base_dir: Path | None = None) -> Config:
 # ---------------------------------------------------------------------------
 
 _SETTINGS_KEYS = {
-    "poll_interval_seconds", "command_timeout_seconds", "connect_timeout_seconds",
-    "minimize_to_tray", "start_minimized", "appearance_mode", "log_lines",
-    "known_hosts_file", "notifications",
+    "poll_interval_seconds", "detail_interval_seconds", "inventory_interval_seconds",
+    "updates_interval_seconds", "command_timeout_seconds", "connect_timeout_seconds",
+    "minimize_to_tray", "start_minimized", "appearance_mode", "log_lines", "process_limit",
+    "known_hosts_file", "notifications", "history", "thresholds", "events",
 }
+_HISTORY_KEYS = {"enabled", "retention_days", "file"}
+_THRESHOLD_KEYS = {"cpu_percent", "mem_percent", "disk_percent", "sustain_polls"}
+_EVENT_KEYS = {"priority", "limit", "since_hours"}
 _NOTIFICATION_KEYS = {
     "enabled", "notify_on_recovery", "notify_on_disconnect", "alert_on_stop",
     "cooldown_seconds", "app_id",
@@ -246,7 +302,9 @@ _NOTIFICATION_KEYS = {
 _SERVER_KEYS = {
     "name", "host", "port", "username", "key_file", "key_passphrase_env", "password_env",
     "allow_agent", "look_for_keys", "host_key_policy", "use_sudo", "docker", "docker_sudo",
-    "logs_sudo", "poll_interval_seconds", "critical_services", "exclude_services",
+    "podman", "podman_sudo", "kubernetes", "kubectl_command", "kubectl_sudo", "libvirt",
+    "libvirt_uri", "libvirt_sudo", "logs_sudo", "network_sudo", "process_actions", "process_sudo",
+    "unit_types", "poll_interval_seconds", "critical_services", "exclude_services",
 }
 _PLAINTEXT_SECRET_KEYS = {"password", "passphrase", "key_passphrase", "sudo_password"}
 
@@ -326,6 +384,24 @@ def _get_patterns(obj: dict, key: str, default: tuple[str, ...], ctx: str, error
     return tuple(patterns)
 
 
+def _get_section(raw: dict, key: str, allowed: set[str], ctx: str, errors: list[str]) -> tuple[dict, str]:
+    section = raw.get(key, {})
+    sctx = f"{ctx}.{key}"
+    if not isinstance(section, dict):
+        errors.append(f"{sctx} deve ser um objeto.")
+        return {}, sctx
+    _reject_unknown(section, allowed, sctx, errors)
+    return section, sctx
+
+
+def _get_mode(raw: dict, key: str, ctx: str, errors: list[str]) -> str:
+    """``auto``/``on``/``off`` (também aceita true/false)."""
+    value = raw.get(key, "auto")
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    return _get_choice(raw, key, RUNTIME_MODES, "auto", ctx, errors)
+
+
 def _expand_path(value: str, base_dir: Path | None) -> Path:
     path = Path(os.path.expandvars(os.path.expanduser(value)))
     if not path.is_absolute() and base_dir is not None:
@@ -358,11 +434,47 @@ def _parse_settings(raw: Any, base_dir: Path | None, errors: list[str]) -> AppSe
         app_id=_get(notif_raw, "app_id", str, None, nctx, errors),
     )
 
+    hist_raw, hctx = _get_section(raw, "history", _HISTORY_KEYS, ctx, errors)
+    defaults_h = HistorySettings()
+    history_file = _get(hist_raw, "file", str, None, hctx, errors)
+    history = HistorySettings(
+        enabled=_get(hist_raw, "enabled", bool, defaults_h.enabled, hctx, errors),
+        retention_days=_get_number(hist_raw, "retention_days", defaults_h.retention_days, 0.1, 3650, hctx, errors),
+        file=_expand_path(history_file, base_dir) if history_file else None,
+    )
+
+    thr_raw, tctx = _get_section(raw, "thresholds", _THRESHOLD_KEYS, ctx, errors)
+    defaults_t = ThresholdSettings()
+    thresholds = ThresholdSettings(
+        cpu_percent=_get_number(thr_raw, "cpu_percent", defaults_t.cpu_percent, 0, 100, tctx, errors),
+        mem_percent=_get_number(thr_raw, "mem_percent", defaults_t.mem_percent, 0, 100, tctx, errors),
+        disk_percent=_get_number(thr_raw, "disk_percent", defaults_t.disk_percent, 0, 100, tctx, errors),
+        sustain_polls=int(_get_number(thr_raw, "sustain_polls", defaults_t.sustain_polls, 1, 100, tctx, errors)),
+    )
+
+    ev_raw, ectx = _get_section(raw, "events", _EVENT_KEYS, ctx, errors)
+    defaults_e = EventSettings()
+    events = EventSettings(
+        priority=_get_choice(ev_raw, "priority", EVENT_PRIORITIES, defaults_e.priority, ectx, errors),
+        limit=int(_get_number(ev_raw, "limit", defaults_e.limit, 10, 1000, ectx, errors)),
+        since_hours=int(_get_number(ev_raw, "since_hours", defaults_e.since_hours, 1, 24 * 30, ectx, errors)),
+    )
+
     defaults = AppSettings()
     known_hosts = _get(raw, "known_hosts_file", str, None, ctx, errors)
     return AppSettings(
         poll_interval_seconds=_get_number(raw, "poll_interval_seconds", defaults.poll_interval_seconds,
                                           MIN_POLL_INTERVAL, MAX_POLL_INTERVAL, ctx, errors),
+        detail_interval_seconds=_get_number(raw, "detail_interval_seconds", defaults.detail_interval_seconds,
+                                            MIN_POLL_INTERVAL, MAX_POLL_INTERVAL, ctx, errors),
+        inventory_interval_seconds=_get_number(raw, "inventory_interval_seconds",
+                                               defaults.inventory_interval_seconds, 10, 86400, ctx, errors),
+        updates_interval_seconds=_get_number(raw, "updates_interval_seconds", defaults.updates_interval_seconds,
+                                             60, 86400 * 7, ctx, errors),
+        process_limit=int(_get_number(raw, "process_limit", defaults.process_limit, 10, 5000, ctx, errors)),
+        history=history,
+        thresholds=thresholds,
+        events=events,
         command_timeout_seconds=_get_number(raw, "command_timeout_seconds", defaults.command_timeout_seconds,
                                             0.5, MAX_COMMAND_TIMEOUT, ctx, errors),
         connect_timeout_seconds=_get_number(raw, "connect_timeout_seconds", defaults.connect_timeout_seconds,
@@ -404,11 +516,19 @@ def _parse_server(raw: Any, index: int, base_dir: Path | None, errors: list[str]
         if not key_file.is_file():
             errors.append(f"{ctx}.key_file: arquivo não encontrado: {key_file}")
 
-    docker_raw = raw.get("docker", "auto")
-    if isinstance(docker_raw, bool):
-        docker = "on" if docker_raw else "off"
-    else:
-        docker = _get_choice(raw, "docker", DOCKER_MODES, "auto", ctx, errors)
+    kubectl_command = _get(raw, "kubectl_command", str, "kubectl", ctx, errors).strip()
+    libvirt_uri = _get(raw, "libvirt_uri", str, "qemu:///system", ctx, errors).strip()
+    for key, value, validate in (("kubectl_command", kubectl_command, validate_kubectl_command),
+                                 ("libvirt_uri", libvirt_uri, validate_libvirt_uri)):
+        try:
+            validate(value)
+        except ValueError:
+            errors.append(f"{ctx}.{key}: valor inválido {value!r}.")
+
+    unit_types = _get_patterns(raw, "unit_types", UNIT_TYPES, ctx, errors)
+    invalid_types = [t for t in unit_types if t not in UNIT_TYPES]
+    if invalid_types:
+        errors.append(f"{ctx}.unit_types: {', '.join(invalid_types)} inválido(s) (use: {', '.join(UNIT_TYPES)}).")
 
     server = ServerConfig(
         name=name,
@@ -422,9 +542,21 @@ def _parse_server(raw: Any, index: int, base_dir: Path | None, errors: list[str]
         look_for_keys=_get(raw, "look_for_keys", bool, True, ctx, errors),
         host_key_policy=_get_choice(raw, "host_key_policy", HOST_KEY_POLICIES, "accept-new", ctx, errors),
         use_sudo=_get(raw, "use_sudo", bool, True, ctx, errors),
-        docker=docker,
+        docker=_get_mode(raw, "docker", ctx, errors),
         docker_sudo=_get(raw, "docker_sudo", bool, False, ctx, errors),
+        podman=_get_mode(raw, "podman", ctx, errors),
+        podman_sudo=_get(raw, "podman_sudo", bool, False, ctx, errors),
+        kubernetes=_get_mode(raw, "kubernetes", ctx, errors),
+        kubectl_command=kubectl_command,
+        kubectl_sudo=_get(raw, "kubectl_sudo", bool, False, ctx, errors),
+        libvirt=_get_mode(raw, "libvirt", ctx, errors),
+        libvirt_uri=libvirt_uri,
+        libvirt_sudo=_get(raw, "libvirt_sudo", bool, False, ctx, errors),
         logs_sudo=_get(raw, "logs_sudo", bool, False, ctx, errors),
+        network_sudo=_get(raw, "network_sudo", bool, False, ctx, errors),
+        process_actions=_get(raw, "process_actions", bool, False, ctx, errors),
+        process_sudo=_get(raw, "process_sudo", bool, False, ctx, errors),
+        unit_types=tuple(t for t in unit_types if t in UNIT_TYPES) or UNIT_TYPES,
         poll_interval_seconds=_get_number(raw, "poll_interval_seconds", None,
                                           MIN_POLL_INTERVAL, MAX_POLL_INTERVAL, ctx, errors),
         critical_services=_get_patterns(raw, "critical_services", ("*",), ctx, errors),
