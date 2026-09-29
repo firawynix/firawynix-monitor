@@ -8,6 +8,7 @@ onde o ProxyCommand do Paramiko não funciona.
 import socket
 import sys
 import threading
+import time
 
 import paramiko
 import pytest
@@ -74,6 +75,9 @@ class _Interface(paramiko.ServerInterface):
         self.commands.append(command.decode() if isinstance(command, bytes) else command)
 
         def reply():
+            # Como o OpenSSH: a saída só vai depois de o pedido "exec" ser confirmado (o Paramiko
+            # confirma quando este método retorna; responder antes fecha o canal no meio do pedido).
+            time.sleep(0.05)
             channel.sendall(b"monitor@ci-windows\n")
             channel.send_exit_status(0)
             channel.close()

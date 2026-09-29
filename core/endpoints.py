@@ -105,6 +105,9 @@ def describe_certificate(der: bytes) -> dict:
 def _tls_connect(spec: EndpointSpec, deadline: float, cafile: str | None) -> tuple[ssl.SSLSocket, str | None]:
     """Handshake verificado; se o certificado for inválido, refaz sem verificar."""
     context = ssl.create_default_context(cafile=cafile)
+    # Valida como os navegadores: o Python 3.13 liga o modo X.509 estrito, que recusa certificados
+    # de CAs internas sem extensões opcionais (ex.: Authority Key Identifier) que o navegador aceita.
+    context.verify_flags &= ~ssl.VERIFY_X509_STRICT
     raw = socket.create_connection((spec.host, spec.port), timeout=_remaining(deadline))
     try:
         return context.wrap_socket(raw, server_hostname=spec.host), None
