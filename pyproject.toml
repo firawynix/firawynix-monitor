@@ -9,6 +9,7 @@ requires-python = ">=3.11"
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-q"
+markers = ["posix_shell: roda comandos do servidor Linux num sh real (pulado no Windows)"]
 
 [tool.ruff]
 line-length = 120

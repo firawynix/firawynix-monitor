@@ -51,6 +51,7 @@ def test_parse_discovery_versions_and_engines():
     assert not empty.has("docker") and empty.tool_for("podman") is None
 
 
+@pytest.mark.posix_shell
 def test_discovery_command_runs_in_a_real_shell():
     result = subprocess.run(["sh", "-c", cmd.wrap_remote_command(eng.DISCOVERY_CMD)], capture_output=True,
                             text=True, timeout=30)
@@ -306,6 +307,7 @@ def test_image_update_comparison():
     assert not eng.updatable(ContainerImage("docker", "1", "app", "1"))  # sem digest de registro
 
 
+@pytest.mark.posix_shell
 def test_image_update_command_digest_matches_sha256sum(tmp_path):
     manifest = tmp_path / "manifest.json"
     manifest.write_bytes(b'{"schemaVersion":2,"manifests":[]}')
@@ -320,6 +322,7 @@ def test_image_update_command_digest_matches_sha256sum(tmp_path):
     assert result.stdout.strip() == hashlib.sha256(manifest.read_bytes()).hexdigest()
 
 
+@pytest.mark.posix_shell
 def test_image_update_command_without_skopeo_exits_127(tmp_path):
     """Sem skopeo o cliente precisa ver 127 ("não instalado"), não um "tag não encontrada"."""
     (tmp_path / "bin").mkdir()
@@ -332,6 +335,7 @@ def test_image_update_command_without_skopeo_exits_127(tmp_path):
     assert result.returncode == 127 and result.stdout == ""
 
 
+@pytest.mark.posix_shell
 def test_image_update_command_picks_a_readable_auth_file(tmp_path):
     """O skopeo recebe --authfile: o do usuário se existir, senão um vazio (anônimo), sempre apagado."""
     fake = tmp_path / "skopeo"
@@ -352,6 +356,7 @@ def test_image_update_command_picks_a_readable_auth_file(tmp_path):
 @pytest.mark.parametrize(("engine_id", "use_sudo", "namespace"), [
     ("docker", True, ""), ("podman", False, ""), ("nerdctl", False, "k8s.io"), ("cri", True, ""),
 ])
+@pytest.mark.posix_shell
 def test_inventory_commands_are_valid_posix_shell(engine_id, use_sudo, namespace):
     command = eng.build_engine_inventory_command(engine_id, use_sudo, namespace)
     for shell in ("sh", "bash"):

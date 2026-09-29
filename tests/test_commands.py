@@ -107,6 +107,7 @@ def test_metrics_command_samples_cpu_twice_only_on_first_poll():
     cmd.build_ports_command(True), cmd.build_pods_command("kubectl", False), cmd.build_events_command("err", 100, 24),
     cmd.build_stack_logs_command("podman", ["a", "b"], 10, True), cmd.build_vm_info_command("qemu:///system", "x", 0),
 ])
+@pytest.mark.posix_shell
 def test_composite_commands_are_valid_posix_shell(command):
     result = subprocess.run(["sh", "-n", "-c", cmd.wrap_remote_command(command)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr

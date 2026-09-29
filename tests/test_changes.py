@@ -195,7 +195,7 @@ def test_run_args_are_quoted_for_the_shell():
 # Tarefas em segundo plano (sh real)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(sys.platform == "win32", reason="comandos do servidor Linux")
+@pytest.mark.posix_shell
 def test_background_job_survives_and_reports_exit_code(tmp_path):
     env = {"HOME": str(tmp_path), "PATH": os.environ["PATH"]}
     job = "fwx-20260929-120000-stop-ab12"

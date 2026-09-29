@@ -1,0 +1,115 @@
+# CI do Firawynix Monitor: lint, testes no Windows (onde o app roda) e no Linux,
+# teste de fumaça da interface num Windows de verdade e o .exe pronto para baixar
+# (aba Actions → execução → Artifacts).
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff==0.15.8
+      - run: ruff check .
+
+  tests:
+    name: Testes (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            python: "3.11"
+          - os: windows-latest
+            python: "3.13"
+          - os: ubuntu-latest
+            python: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pytest -ra
+
+  ui-smoke:
+    name: Interface no Windows (fumaça)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: python -m pip install -r requirements.txt
+      - run: python scripts/smoke_ui.py --out capturas
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: capturas-windows
+          path: capturas/
+          if-no-files-found: ignore
+
+  build:
+    name: Executável Windows (.exe)
+    needs: [lint, tests]
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m PyInstaller --noconfirm --clean FirawynixMonitor.spec
+      - name: Fumaça do .exe (modo demonstração por 20 s)
+        shell: pwsh
+        run: |
+          $proc = Start-Process -FilePath dist\FirawynixMonitor.exe -ArgumentList "--demo" -PassThru
+          Start-Sleep -Seconds 20
+          $log = Join-Path $env:LOCALAPPDATA "FirawynixMonitor\logs\monitor.log"
+          if (Test-Path $log) { Get-Content $log -Tail 40 }
+          if ($proc.HasExited) { throw "O executável encerrou sozinho (código $($proc.ExitCode))." }
+          Stop-Process -Id $proc.Id -Force
+          if ((Test-Path $log) -and (Select-String -Path $log -Pattern "Exceção não tratada" -Quiet)) {
+            throw "Exceção não tratada no log do executável."
+          }
+      - name: Pacote para download
+        shell: pwsh
+        run: |
+          Copy-Item servers.example.json, .env.example dist\
+          Copy-Item docs\firawynix-volume-backup, docs\sudoers.example dist\
+          (Get-FileHash dist\FirawynixMonitor.exe -Algorithm SHA256).Hash | Out-File dist\FirawynixMonitor.exe.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FirawynixMonitor-windows
+          path: dist/
