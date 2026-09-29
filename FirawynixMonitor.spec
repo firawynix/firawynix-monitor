@@ -13,8 +13,10 @@ ROOT = Path(SPECPATH)
 ICON = ROOT / "assets" / "app.ico"
 VERSION_FILE = ROOT / "packaging" / "version_info.txt"
 
-# Temas JSON e fontes do CustomTkinter não são detectados pela análise estática.
+# Temas JSON e fontes do CustomTkinter não são detectados pela análise estática;
+# o tema ciano do app vai em ui/themes (lido via sys._MEIPASS em ui/theme.py).
 datas = collect_data_files("customtkinter")
+datas.append((str(ROOT / "ui" / "themes" / "cyan.json"), "ui/themes"))
 
 # Backends carregados dinamicamente (pystray/plyer escolhem a implementação em
 # tempo de execução; win11toast importa módulos WinRT nativos).

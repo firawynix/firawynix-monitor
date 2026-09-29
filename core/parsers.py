@@ -6,32 +6,49 @@ interpretadas são ignoradas em vez de derrubar a coleta inteira.
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
+import fnmatch
+import hashlib
 import ipaddress
 import json
 import logging
 import re
+import struct
 from dataclasses import dataclass, field
 
 from core.commands import SECTION
 from core.models import (
     SYSTEMD_UNIT_TYPES,
+    AuthorizedKey,
+    BandwidthUsage,
     CronEntry,
     DiskIO,
     DiskUsage,
+    Fail2banJail,
+    FailedLoginSource,
     HostMetrics,
     InterfaceStats,
     JournalEntry,
     ListeningSocket,
+    LoginEvent,
     NetworkInfo,
+    OomKill,
     ProcessInfo,
     RuntimeState,
+    SecurityRaw,
     ServiceInfo,
     ServiceKind,
     ServiceStatus,
+    SessionInfo,
+    SmartDisk,
+    SmartReport,
+    SshLoginReport,
+    SudoEvent,
     SystemInfo,
     TimerInfo,
     UpdatesInfo,
+    VpsInfo,
 )
 
 log = logging.getLogger(__name__)
@@ -470,6 +487,65 @@ def parse_virsh_list(output: str) -> list[ServiceInfo]:
     return vms
 
 
+def classify_lxd(status: str) -> ServiceStatus:
+    status = (status or "").lower()
+    if status == "running":
+        return ServiceStatus.ACTIVE
+    if status in {"stopped", "frozen"}:
+        return ServiceStatus.STOPPED
+    if status == "error":
+        return ServiceStatus.FAILED
+    if status in {"starting", "stopping", "freezing", "thawed", "restarting"}:
+        return ServiceStatus.ACTIVATING
+    return ServiceStatus.UNKNOWN
+
+
+def parse_lxd_list(output: str) -> tuple[str, list[ServiceInfo], dict[str, int]]:
+    """``CLI=<cliente>`` + JSON de ``incus/lxc list`` → (cliente, instâncias, uso de CPU em ns)."""
+    cli, _, rest = output.lstrip().partition("\n")
+    cli = cli.removeprefix("CLI=").strip() if cli.startswith("CLI=") else "lxc"
+    text = rest.strip() if output.lstrip().startswith("CLI=") else output.strip()
+    if not text:
+        return cli, [], {}
+    data = json.loads(text)
+    if not isinstance(data, list):
+        raise ValueError("Saída do list não é uma lista")
+    instances, cpu_usage = [], {}
+    for item in data:
+        if not isinstance(item, dict) or not item.get("name"):
+            continue
+        name = str(item["name"])
+        status = str(item.get("status") or "")
+        state = item.get("state") if isinstance(item.get("state"), dict) else {}
+        config = item.get("config") if isinstance(item.get("config"), dict) else {}
+        memory = (state.get("memory") or {}).get("usage") if isinstance(state.get("memory"), dict) else None
+        cpu = (state.get("cpu") or {}).get("usage") if isinstance(state.get("cpu"), dict) else None
+        running = status.lower() == "running"
+        if isinstance(cpu, int) and running:
+            cpu_usage[name] = cpu
+        ipv4 = ""
+        for iface, net in (state.get("network") or {}).items():
+            if iface == "lo" or not isinstance(net, dict):
+                continue
+            for address in net.get("addresses") or []:
+                if isinstance(address, dict) and address.get("family") == "inet" and address.get("scope") == "global":
+                    ipv4 = ipv4 or str(address.get("address", ""))
+        kind_text = str(item.get("type") or "container")
+        project = str(item.get("project") or "default")
+        instances.append(ServiceInfo(
+            kind=ServiceKind.LXD,
+            name=name,
+            description=str(config.get("image.description") or item.get("description") or kind_text),
+            status=classify_lxd(status),
+            active_state=status.lower() or "?",
+            sub_state=status + (f" · {ipv4}" if ipv4 else ""),
+            group="" if project == "default" else project,
+            mem_bytes=memory if isinstance(memory, int) and running else None,
+            meta=(("type", kind_text), ("cli", cli), ("ipv4", ipv4), ("project", project)),
+        ))
+    return cli, instances, cpu_usage
+
+
 def classify_runtime_error(kind: ServiceKind, exit_code: int, output: str) -> tuple[RuntimeState, str]:
     """Traduz a falha de um runtime (docker, podman, kubectl, virsh) em estado + dica."""
     label = kind.label
@@ -495,6 +571,12 @@ def classify_runtime_error(kind: ServiceKind, exit_code: int, output: str) -> tu
             return RuntimeState.PERMISSION, f"Sem permissão no cluster: {first_line}"
         if "connection to the server" in lower or "unable to connect to the server" in lower:
             return RuntimeState.DAEMON_DOWN, f"API do Kubernetes inacessível: {first_line}"
+    elif kind is ServiceKind.LXD:
+        if "permission denied" in lower or "needed permissions" in lower:
+            return RuntimeState.PERMISSION, ("Sem permissão no LXD/Incus. Adicione o usuário ao grupo 'lxd' "
+                                             "(ou 'incus-admin') ou habilite \"lxd_sudo\".")
+        if "unix.socket" in lower or "daemon" in lower or "connection refused" in lower:
+            return RuntimeState.DAEMON_DOWN, "O serviço do LXD/Incus não está acessível."
     elif kind is ServiceKind.LIBVIRT:
         if "permission denied" in lower or "authentication" in lower:
             return RuntimeState.PERMISSION, ("Sem permissão no libvirt. Adicione o usuário ao grupo 'libvirt' "
@@ -530,9 +612,12 @@ def parse_cpu_count(text: str) -> int | None:
         return None
 
 
-def parse_cpu_samples(text: str) -> list[tuple[int, int]]:
-    """Linhas ``cpu ...`` de /proc/stat → lista de (ocioso, total) em jiffies."""
-    samples: list[tuple[int, int]] = []
+CpuSample = tuple[int, ...]
+
+
+def parse_cpu_samples(text: str) -> list[CpuSample]:
+    """Linhas ``cpu ...`` de /proc/stat → (ocioso+iowait, total, iowait, steal) em jiffies."""
+    samples: list[CpuSample] = []
     for line in text.splitlines():
         fields = line.split()
         if not fields or fields[0] != "cpu":
@@ -545,12 +630,25 @@ def parse_cpu_samples(text: str) -> list[tuple[int, int]]:
             continue
         # user nice system idle iowait irq softirq steal (guest já está em user)
         core = values[:8]
-        idle = core[3] + (core[4] if len(core) > 4 else 0)
-        samples.append((idle, sum(core)))
+        iowait = core[4] if len(core) > 4 else 0
+        steal = core[7] if len(core) > 7 else 0
+        samples.append((core[3] + iowait, sum(core), iowait, steal))
     return samples
 
 
-def cpu_percent_between(previous: tuple[int, int], current: tuple[int, int]) -> float | None:
+def cpu_breakdown_between(previous: CpuSample, current: CpuSample) -> tuple[float | None, float | None]:
+    """(% iowait, % steal) entre duas amostras; None se a amostra não trouxer os campos."""
+    if len(previous) < 4 or len(current) < 4:
+        return None, None
+    total = current[1] - previous[1]
+    if total <= 0:
+        return None, None
+    iowait, steal = current[2] - previous[2], current[3] - previous[3]
+    clamp = lambda v: max(0.0, min(100.0, 100.0 * v / total))  # noqa: E731
+    return clamp(iowait), clamp(steal)
+
+
+def cpu_percent_between(previous: CpuSample, current: CpuSample) -> float | None:
     idle_delta = current[0] - previous[0]
     total_delta = current[1] - previous[1]
     if total_delta <= 0 or idle_delta < 0:
@@ -685,7 +783,7 @@ def parse_diskstats(text: str) -> dict[str, tuple[int, int]]:
 class MetricsState:
     """Amostras anteriores usadas para calcular taxas (CPU, rede, disco)."""
 
-    cpu: tuple[int, int] | None = None
+    cpu: CpuSample | None = None
     uptime: float | None = None
     net: dict[str, tuple[int, int]] = field(default_factory=dict)
     disk: dict[str, tuple[int, int]] = field(default_factory=dict)
@@ -703,11 +801,11 @@ def parse_metrics(output: str, previous: MetricsState | None) -> tuple[HostMetri
     uptime_s, load_s, nproc_s, cpu_s, free_s, df_s, net_s, disk_s = split_sections(output, 8)[:8]
 
     samples = parse_cpu_samples(cpu_s)
-    cpu_pct = None
-    if len(samples) >= 2:
-        cpu_pct = cpu_percent_between(samples[-2], samples[-1])
-    elif samples and previous.cpu is not None:
-        cpu_pct = cpu_percent_between(previous.cpu, samples[-1])
+    cpu_pct = iowait = steal = None
+    baseline = samples[-2] if len(samples) >= 2 else previous.cpu if samples else None
+    if baseline is not None:
+        cpu_pct = cpu_percent_between(baseline, samples[-1])
+        iowait, steal = cpu_breakdown_between(baseline, samples[-1])
 
     uptime = parse_uptime(uptime_s)
     elapsed = uptime - previous.uptime if uptime is not None and previous.uptime is not None else None
@@ -736,6 +834,8 @@ def parse_metrics(output: str, previous: MetricsState | None) -> tuple[HostMetri
         load_avg=parse_loadavg(load_s),
         cpu_count=parse_cpu_count(nproc_s),
         cpu_percent=cpu_pct,
+        cpu_steal=steal,
+        cpu_iowait=iowait,
         mem_total_mb=memory.get("total"),
         mem_used_mb=memory.get("used"),
         mem_available_mb=memory.get("available"),
@@ -1059,6 +1159,497 @@ def parse_updates(output: str) -> UpdatesInfo | None:
 
 
 # ---------------------------------------------------------------------------
+# VPS
+# ---------------------------------------------------------------------------
+
+_PROVIDERS = (
+    ("digitalocean", "DigitalOcean"), ("hetzner", "Hetzner Cloud"), ("vultr", "Vultr"),
+    ("linode", "Akamai/Linode"), ("akamai", "Akamai/Linode"), ("amazon ec2", "AWS EC2"), ("amazon", "AWS"),
+    ("google", "Google Cloud"), ("alibaba", "Alibaba Cloud"), ("tencent", "Tencent Cloud"),
+    ("oracle", "Oracle Cloud"), ("scaleway", "Scaleway"), ("ovh", "OVHcloud"), ("upcloud", "UpCloud"),
+    ("contabo", "Contabo"), ("magalu", "Magalu Cloud"), ("locaweb", "Locaweb"), ("hostinger", "Hostinger"),
+    ("openstack", "OpenStack"), ("vmware", "VMware"), ("proxmox", "Proxmox VE"), ("innotek", "VirtualBox"),
+    ("xen", "Xen"), ("bochs", "KVM/QEMU"), ("qemu", "KVM/QEMU"),
+)
+
+
+def detect_provider(vendor: str, product: str, bios: str = "", hypervisor: str = "") -> str:
+    """Nome amigável da plataforma a partir do DMI (legível sem root)."""
+    haystack = " ".join((vendor, product, bios, hypervisor)).lower()
+    if "microsoft" in haystack and "virtual machine" in haystack:
+        return "Azure / Hyper-V"
+    for needle, label in _PROVIDERS:
+        if needle in haystack:
+            return label
+    return vendor.strip() or ("Xen" if hypervisor.strip() == "xen" else "")
+
+
+def _vnstat_entry_date(entry: dict) -> tuple[int, int, int]:
+    date = entry.get("date") if isinstance(entry.get("date"), dict) else {}
+    return int(date.get("year") or 0), int(date.get("month") or 0), int(date.get("day") or 0)
+
+
+def parse_vnstat(month_text: str, day_text: str = "") -> tuple[BandwidthUsage, ...]:
+    """JSON do vnStat 2.x (bytes, "month"/"day") ou 1.x (KiB, "months"/"days")."""
+    def load(text: str) -> dict:
+        text = text.strip()
+        if not text.startswith("{"):
+            return {}
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    months, days = load(month_text), load(day_text)
+    scale = 1024 if str(months.get("jsonversion", "2")) == "1" else 1
+    today: dict[str, tuple[int, int]] = {}
+    for iface in days.get("interfaces") or []:
+        traffic = iface.get("traffic") or {}
+        entries = [e for e in (traffic.get("day") or traffic.get("days") or []) if isinstance(e, dict)]
+        if entries:
+            latest = max(entries, key=_vnstat_entry_date)
+            day_scale = 1024 if str(days.get("jsonversion", "2")) == "1" else 1
+            today[str(iface.get("name") or iface.get("id") or "")] = (int(latest.get("rx", 0)) * day_scale,
+                                             int(latest.get("tx", 0)) * day_scale)
+    usage = []
+    for iface in months.get("interfaces") or []:
+        name = str(iface.get("name") or iface.get("id") or "")
+        if not name or is_virtual_interface(name):
+            continue
+        traffic = iface.get("traffic") or {}
+        entries = [e for e in (traffic.get("month") or traffic.get("months") or []) if isinstance(e, dict)]
+        if not entries:
+            continue
+        latest = max(entries, key=_vnstat_entry_date)
+        year, month, _ = _vnstat_entry_date(latest)
+        rx_today, tx_today = today.get(name, (None, None))
+        usage.append(BandwidthUsage(interface=name, period=f"{year:04d}-{month:02d}",
+                                    rx_bytes=int(latest.get("rx", 0)) * scale,
+                                    tx_bytes=int(latest.get("tx", 0)) * scale,
+                                    today_rx=rx_today, today_tx=tx_today))
+    return tuple(usage)
+
+
+_OOM_PROCESS_RE = re.compile(r"Kill(?:ed)? process \d+ \(([^)]*)\)")
+
+
+def parse_vps(output: str) -> VpsInfo:
+    """Saída de :data:`core.commands.VPS_CMD`."""
+    host_s, time_s, oom_s, vnstat_s = split_sections(output, 4)[:4]
+    values: dict[str, str] = {}
+    dns, gateway = [], ""
+    for line in host_s.splitlines():
+        if line.startswith("nameserver"):
+            parts = line.split()
+            if len(parts) > 1:
+                dns.append(parts[1])
+        elif line.startswith("default ") and not gateway:
+            parts = line.split()
+            gateway = " ".join(parts[1:5]) if len(parts) > 2 else ""
+            if "via" in parts and "dev" in parts:
+                gateway = f"{parts[parts.index('via') + 1]} ({parts[parts.index('dev') + 1]})"
+        else:
+            key, sep, value = line.partition("=")
+            if sep:
+                values[key.strip()] = value.strip()
+
+    synced, ntp_service, offset = None, "", None
+    for line in time_s.splitlines():
+        key, sep, value = line.partition("=") if "=" in line else line.partition(":")
+        key, value = key.strip().lower(), value.strip().lower()
+        if key in {"ntpsynchronized", "system clock synchronized", "ntp synchronized"}:
+            synced = value == "yes"
+        elif key in {"ntp", "ntp service", "network time on"}:
+            ntp_service = {"yes": "ativo", "active": "ativo", "no": "inativo", "inactive": "inativo"}.get(value, value)
+        elif key == "system time":
+            match = re.match(r"([\d.]+) seconds (fast|slow)", value)
+            if match:
+                offset = float(match.group(1)) * (1 if match.group(2) == "fast" else -1)
+
+    oom_total, kills = None, []
+    for line in oom_s.splitlines():
+        if line.startswith("OOM_TOTAL"):
+            parts = line.split()
+            oom_total = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+            continue
+        match = _OOM_PROCESS_RE.search(line)
+        stamp = line.split(None, 1)[0] if line.strip() else ""
+        if match:
+            try:
+                kills.append(OomKill(float(stamp), match.group(1)))
+            except ValueError:
+                continue
+
+    bandwidth, source = (), ""
+    if vnstat_s.strip() and not vnstat_s.strip().startswith("NOVNSTAT"):
+        month_text, _, day_text = vnstat_s.partition("#DAY")
+        bandwidth = parse_vnstat(month_text, day_text)
+        source = "vnstat"
+    swappiness = values.get("swappiness", "")
+    return VpsInfo(
+        provider=detect_provider(values.get("sys_vendor", ""), values.get("product_name", ""),
+                                 values.get("bios_vendor", ""), values.get("hypervisor", "")),
+        product=" ".join(v for v in (values.get("sys_vendor", ""), values.get("product_name", "")) if v),
+        ntp_synchronized=synced,
+        ntp_service=ntp_service,
+        clock_offset=offset,
+        dns_servers=tuple(dns),
+        default_gateway=gateway,
+        swappiness=int(swappiness) if swappiness.isdigit() else None,
+        oom_kills=tuple(sorted(kills, key=lambda k: k.timestamp, reverse=True)),
+        oom_kills_24h=oom_total,
+        bandwidth=bandwidth,
+        bandwidth_source=source,
+    )
+
+
+# ---------------------------------------------------------------------------
+# SMART
+# ---------------------------------------------------------------------------
+
+_ATA_ATTRIBUTES = {5: "reallocated", 197: "pending", 198: "uncorrectable"}
+
+
+def _smart_disk(device: str, text: str) -> SmartDisk:
+    start = text.find("{")
+    try:
+        data = json.loads(text[start:]) if start >= 0 else None
+    except json.JSONDecodeError:
+        data = None
+    if not isinstance(data, dict):
+        first = next((line.strip() for line in text.splitlines() if line.strip()), "sem resposta")
+        if "unrecognized option" in text.lower() or "unknown option" in text.lower():
+            first = "smartctl sem suporte a JSON (-j): atualize para smartmontools 7 ou superior"
+        return SmartDisk(device=device, message=first[:200])
+    status = data.get("smart_status") if isinstance(data.get("smart_status"), dict) else {}
+    nvme = data.get("nvme_smart_health_information_log")
+    nvme = nvme if isinstance(nvme, dict) else {}
+    attributes: dict[str, int] = {}
+    table = (data.get("ata_smart_attributes") or {}).get("table") if isinstance(
+        data.get("ata_smart_attributes"), dict) else None
+    for row in table or []:
+        if isinstance(row, dict) and row.get("id") in _ATA_ATTRIBUTES:
+            raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+            if isinstance(raw.get("value"), int):
+                attributes[_ATA_ATTRIBUTES[row["id"]]] = raw["value"]
+    temperature = (data.get("temperature") or {}).get("current") if isinstance(data.get("temperature"), dict) \
+        else None
+    if temperature is None and isinstance(nvme.get("temperature"), int | float):
+        temperature = nvme["temperature"]
+    hours = (data.get("power_on_time") or {}).get("hours") if isinstance(data.get("power_on_time"), dict) else None
+    capacity = (data.get("user_capacity") or {}).get("bytes") if isinstance(data.get("user_capacity"), dict) \
+        else data.get("nvme_total_capacity")
+    message = ""
+    if "passed" not in status:
+        messages = (data.get("smartctl") or {}).get("messages") if isinstance(data.get("smartctl"), dict) else None
+        errors = [m.get("string", "") for m in messages or [] if isinstance(m, dict)]
+        message = next((m for m in errors if m), "SMART indisponível neste dispositivo")
+    return SmartDisk(
+        device=str((data.get("device") or {}).get("name") or device) if isinstance(data.get("device"), dict)
+        else device,
+        model=str(data.get("model_name") or data.get("model_family") or ""),
+        serial=str(data.get("serial_number") or ""),
+        capacity_bytes=capacity if isinstance(capacity, int) else None,
+        passed=status.get("passed") if isinstance(status.get("passed"), bool) else None,
+        temperature=float(temperature) if isinstance(temperature, int | float) else None,
+        power_on_hours=hours if isinstance(hours, int) else nvme.get("power_on_hours"),
+        reallocated=attributes.get("reallocated"),
+        pending=attributes.get("pending"),
+        uncorrectable=attributes.get("uncorrectable"),
+        media_errors=nvme.get("media_errors") if isinstance(nvme.get("media_errors"), int) else None,
+        percentage_used=nvme.get("percentage_used") if isinstance(nvme.get("percentage_used"), int) else None,
+        critical_warning=nvme.get("critical_warning") if isinstance(nvme.get("critical_warning"), int) else None,
+        message=message[:200],
+    )
+
+
+def parse_smart(output: str) -> SmartReport:
+    blocks = re.split(r"^## (\S+)\s*$", output, flags=re.M)
+    disks = tuple(_smart_disk(blocks[i], blocks[i + 1]) for i in range(1, len(blocks) - 1, 2))
+    if not disks:
+        return SmartReport(RuntimeState.OK, (), "Nenhum disco físico com SMART (discos virtuais de VPS não têm).")
+    lowered = " ".join(d.message.lower() for d in disks)
+    if all(d.message for d in disks) and ("permission denied" in lowered or "a password is required" in lowered
+                                          or "operation not permitted" in lowered):
+        return SmartReport(RuntimeState.PERMISSION, disks,
+                           "O smartctl precisa de root: habilite \"smart_sudo\" (NOPASSWD no sudoers).")
+    return SmartReport(RuntimeState.OK, disks)
+
+
+# ---------------------------------------------------------------------------
+# Segurança
+# ---------------------------------------------------------------------------
+
+_SSHD_MULTI = {"port", "listenaddress", "allowusers", "allowgroups", "denyusers", "denygroups"}
+_SSHD_SPLIT_RE = re.compile(r"\s*=\s*|\s+")
+
+
+def _sshd_line(line: str) -> tuple[str, str] | None:
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    parts = _SSHD_SPLIT_RE.split(line, maxsplit=1)
+    if len(parts) < 2:
+        return None
+    return parts[0].lower(), parts[1].strip().strip('"')
+
+
+def parse_sshd_effective(text: str) -> dict[str, str]:
+    """``sshd -T``: uma opção por linha, chaves já minúsculas e valores efetivos."""
+    config: dict[str, str] = {}
+    for line in text.splitlines():
+        parsed = _sshd_line(line)
+        if parsed is None:
+            continue
+        key, value = parsed
+        if key in _SSHD_MULTI and key in config:
+            config[key] += " " + value
+        else:
+            config.setdefault(key, value)
+    return config
+
+
+def parse_sshd_files(text: str) -> dict[str, str]:
+    """Emula a leitura do sshd sem root: ``Include`` (glob, ordem alfabética), primeira
+    ocorrência vence e tudo após ``Match`` é condicional (ignorado)."""
+    files: dict[str, list[str]] = {}
+    current = None
+    for line in text.splitlines():
+        if line.startswith("#FILE "):
+            current = line[6:].strip()
+            files[current] = []
+        elif current is not None:
+            files[current].append(line)
+    config: dict[str, str] = {}
+    visited: set[str] = set()
+
+    def process(path: str, depth: int) -> None:
+        if path in visited or depth > 8:
+            return
+        visited.add(path)
+        for raw in files.get(path, ()):
+            parsed = _sshd_line(raw)
+            if parsed is None:
+                continue
+            key, value = parsed
+            if key == "match":
+                return
+            if key == "include":
+                for pattern in value.split():
+                    pattern = pattern if pattern.startswith("/") else f"/etc/ssh/{pattern}"
+                    for candidate in sorted(p for p in files if fnmatch.fnmatchcase(p, pattern)):
+                        process(candidate, depth + 1)
+                continue
+            if key in _SSHD_MULTI and key in config:
+                config[key] += " " + value
+            else:
+                config.setdefault(key, value)
+
+    main = "/etc/ssh/sshd_config"
+    for path in ([main] if main in files else list(files)):
+        process(path, 0)
+    return config
+
+
+_KEY_RE = re.compile(r"(?:^|\s)((?:ssh|ecdsa|sk)-[A-Za-z0-9@.-]+)\s+([A-Za-z0-9+/]+={0,3})(?:\s+(.*))?$")
+_KEY_BITS = {"ssh-ed25519": 256, "sk-ssh-ed25519@openssh.com": 256, "ssh-dss": 1024}
+
+
+def _rsa_bits(blob: bytes) -> int | None:
+    try:
+        offset, fields = 0, []
+        for _ in range(3):  # "ssh-rsa", e, n
+            (length,) = struct.unpack(">I", blob[offset:offset + 4])
+            fields.append(blob[offset + 4:offset + 4 + length])
+            offset += 4 + length
+        return int.from_bytes(fields[2], "big").bit_length()
+    except (struct.error, IndexError):
+        return None
+
+
+def parse_authorized_keys(text: str) -> tuple[AuthorizedKey, ...]:
+    keys = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = _KEY_RE.search(line)
+        if not match:
+            continue
+        key_type, encoded, comment = match.group(1), match.group(2), (match.group(3) or "").strip()
+        try:
+            blob = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError):
+            continue
+        fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+        bits = _rsa_bits(blob) if key_type == "ssh-rsa" else _KEY_BITS.get(key_type)
+        if bits is None and "nistp" in key_type:
+            bits = int(re.search(r"nistp(\d+)", key_type).group(1))
+        options = line[:match.start(1)].strip()
+        keys.append(AuthorizedKey(key_type, bits, fingerprint, comment,
+                                  restricted=any(o in options for o in ("from=", "command=", "restrict"))))
+    return tuple(keys)
+
+
+def parse_who(text: str) -> tuple[SessionInfo, ...]:
+    sessions = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        source = ""
+        if fields[-1].startswith("(") and fields[-1].endswith(")"):
+            source = fields[-1][1:-1]
+            fields = fields[:-1]
+        sessions.append(SessionInfo(user=fields[0], tty=fields[1], source=source, since=" ".join(fields[2:])))
+    return tuple(sessions)
+
+
+def parse_security(output: str) -> SecurityRaw:
+    """Saída de :func:`core.commands.build_security_command` (sem o fail2ban)."""
+    sshd_s, kv_s, who_s, keys_s = split_sections(output, 4)[:4]
+    if sshd_s.lstrip().startswith("#FILES"):
+        sshd = parse_sshd_files(sshd_s)
+        sshd_source = "arquivos" if sshd else ""
+    else:
+        sshd = parse_sshd_effective(sshd_s)
+        sshd_source = "sshd -T" if sshd else ""
+    services, binaries, sysctl = {}, set(), {}
+    uid0, logins, sudoers = [], [], []
+    values: dict[str, str] = {}
+    ufw_lines: list[str] | None = None
+    for line in kv_s.splitlines():
+        if ufw_lines is not None:
+            ufw_lines.append(line)
+            continue
+        if line.strip() == "#UFW":
+            ufw_lines = []
+            continue
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        if key == "svc":
+            name, _, state = value.partition("=")
+            services[name] = state.strip()
+        elif key == "bin":
+            binaries.add(value.strip())
+        elif key == "sysctl":
+            name, _, setting = value.partition("=")
+            sysctl[name.replace("/", ".")] = setting.strip()
+        elif key == "uid0":
+            uid0.append(value.strip())
+        elif key == "login":
+            logins.append(value.strip())
+        elif key == "sudoer":
+            sudoers.append(value.strip())
+        else:
+            values[key] = value.strip()
+
+    def to_int(name: str) -> int | None:
+        return int(values[name]) if values.get(name, "").isdigit() else None
+
+    ufw_status = "\n".join(ufw_lines or []).strip()
+    ufw_enabled = {"yes": True, "no": False}.get(values.get("ufw_enabled", "").lower())
+    if ufw_status.lower().startswith("status: active"):
+        ufw_enabled = True
+    elif ufw_status.lower().startswith("status: inactive"):
+        ufw_enabled = False
+    apparmor = {"y": True, "n": False}.get(values.get("apparmor", "").lower())
+    return SecurityRaw(
+        sshd=sshd, sshd_source=sshd_source, services=services, binaries=frozenset(binaries),
+        ssh_client=values.get("ssh_client", ""), ufw_enabled=ufw_enabled, ufw_status=ufw_status,
+        iptables_rules=to_int("ipt_rules"), iptables_input_policy=values.get("ipt_policy", ""),
+        nft_rules=to_int("nft_rules"), uid0_users=tuple(uid0), login_users=tuple(logins),
+        sudo_users=tuple(dict.fromkeys(sudoers)), sysctl=sysctl, apparmor=apparmor,
+        selinux=values.get("selinux", ""), auto_updates=values.get("auto_apt"),
+        tmp_mode=values.get("tmp_mode", ""), sessions=parse_who(who_s),
+        authorized_keys=parse_authorized_keys(keys_s),
+    )
+
+
+_F2B_NUMBER_RE = {
+    "currently_failed": re.compile(r"Currently failed:\s*(\d+)"),
+    "total_failed": re.compile(r"Total failed:\s*(\d+)"),
+    "currently_banned": re.compile(r"Currently banned:\s*(\d+)"),
+    "total_banned": re.compile(r"Total banned:\s*(\d+)"),
+}
+_F2B_BANNED_RE = re.compile(r"Banned IP list:[ \t]*(.*)")
+
+
+def parse_fail2ban(output: str) -> tuple[Fail2banJail, ...]:
+    jails = []
+    for block in re.split(r"^## ", output, flags=re.M)[1:]:
+        name, _, body = block.partition("\n")
+        numbers = {}
+        for field_name, pattern in _F2B_NUMBER_RE.items():
+            match = pattern.search(body)
+            numbers[field_name] = int(match.group(1)) if match else None
+        banned = _F2B_BANNED_RE.search(body)
+        ips = tuple(ip for ip in (banned.group(1).split() if banned else ()) if ip)[:500]
+        jails.append(Fail2banJail(name=name.strip(), banned_ips=ips, **numbers))
+    return tuple(jails)
+
+
+_ACCEPTED_RE = re.compile(r"Accepted (\S+) for (\S+) from (\S+) port \d+")
+
+
+def parse_ssh_logins(output: str, complete: bool = True) -> SshLoginReport:
+    total, sources, accepted = 0, [], []
+    for line in output.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        if fields[0] == "TOTAL" and len(fields) > 1 and fields[1].isdigit():
+            total = int(fields[1])
+        elif fields[0] == "F" and len(fields) >= 4 and fields[1].isdigit():
+            try:
+                sources.append(FailedLoginSource(source=fields[3], count=int(fields[1]),
+                                                 last_seen=float(fields[2]),
+                                                 last_user=fields[4] if len(fields) > 4 else ""))
+            except ValueError:
+                continue
+        else:
+            match = _ACCEPTED_RE.search(line)
+            if match:
+                try:
+                    accepted.append(LoginEvent(float(fields[0]), match.group(2), match.group(3), match.group(1)))
+                except ValueError:
+                    continue
+    sources.sort(key=lambda s: (-s.count, -s.last_seen))
+    accepted.sort(key=lambda e: e.timestamp, reverse=True)
+    return SshLoginReport(tuple(accepted), tuple(sources[:500]), total, complete)
+
+
+_SUDO_LINE_RE = re.compile(r"^(\S+)\s+\S+\s+\S+\s+(\S+) : (.*)$")
+
+
+def parse_sudo_log(output: str) -> tuple[SudoEvent, ...]:
+    events = []
+    for line in output.splitlines():
+        match = _SUDO_LINE_RE.match(line.strip())
+        if not match:
+            continue
+        stamp, user, body = match.groups()
+        _, _, command = body.partition("COMMAND=")
+        fields = {}
+        for part in body.split(" ; "):
+            key, sep, value = part.partition("=")
+            if sep and key.isupper():
+                fields[key] = value
+        lower = body.lower()
+        outcome = "senha incorreta" if "incorrect password" in lower else "negado" if "not in sudoers" in lower \
+            else "ok"
+        try:
+            events.append(SudoEvent(float(stamp), user, command.strip(), outcome, fields.get("USER", ""),
+                                    fields.get("TTY", "")))
+        except ValueError:
+            continue
+    events.sort(key=lambda e: e.timestamp, reverse=True)
+    return tuple(events)
+
+
+# ---------------------------------------------------------------------------
 # Utilidades
 # ---------------------------------------------------------------------------
 
@@ -1081,6 +1672,8 @@ def describe_sudo_failure(output: str) -> str | None:
                 "sudoers com NOPASSWD para os comandos permitidos.")
     if "operation not permitted" in lower:
         return "Operação não permitida para o usuário SSH (processo de outro usuário?)."
+    if "you must be root" in lower or "permission denied to socket" in lower:
+        return "O fail2ban-client exige root: habilite \"security_sudo\" e libere o comando no sudoers."
     return None
 
 

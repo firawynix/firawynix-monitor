@@ -2,8 +2,9 @@
 
 O arquivo de configuração nunca contém segredos: senhas e passphrases são
 referenciadas pelo *nome* de uma variável de ambiente (``password_env`` /
-``key_passphrase_env``), que pode ser definida no sistema ou em um ``.env``
-localizado ao lado do ``servers.json``.
+``key_passphrase_env``, definida no sistema ou em um ``.env`` ao lado do
+``servers.json``) ou ficam no Gerenciador de Credenciais do Windows
+(``password_credential`` / ``key_passphrase_credential``).
 """
 
 from __future__ import annotations
@@ -34,6 +35,9 @@ RUNTIME_MODES = ("auto", "on", "off")
 APPEARANCE_MODES = ("dark", "light", "system")
 EVENT_PRIORITIES = ("emerg", "alert", "crit", "err", "warning", "notice")
 UNIT_TYPES = ("service", "timer", "socket", "mount", "path")
+LATENCY_PROBES = ("auto", "icmp", "ssh", "off")
+LOGIN_NOTIFY = ("root", "all", "off")
+BANDWIDTH_COUNT = ("tx", "total")
 
 
 class ConfigError(Exception):
@@ -49,6 +53,10 @@ class NotificationSettings:
     cooldown_seconds: float = 120.0
     #: AppUserModelID usado nos toasts do Windows (None = padrão do win11toast).
     app_id: str | None = None
+    #: Alertas de novas falhas críticas de segurança, SMART e endpoints.
+    security_alerts: bool = True
+    #: Logins SSH aceitos que geram alerta: só do root, de qualquer usuário ou nenhum.
+    notify_on_ssh_login: str = "root"
 
 
 @dataclass(frozen=True)
@@ -66,6 +74,10 @@ class ThresholdSettings:
     cpu_percent: float = 90.0
     mem_percent: float = 90.0
     disk_percent: float = 90.0
+    #: CPU "roubada" pelo hipervisor (VPS sobrecarregada pelo provedor).
+    steal_percent: float = 10.0
+    #: Latência Windows → servidor (0 = sem alerta).
+    latency_ms: float = 0.0
     #: Coletas seguidas acima do limite antes de alertar (evita picos momentâneos).
     sustain_polls: int = 3
 
@@ -78,6 +90,20 @@ class EventSettings:
 
 
 @dataclass(frozen=True)
+class WindowsSettings:
+    """Integrações com a API do Windows (ignoradas em outros sistemas)."""
+
+    #: Alertas e ações no Visualizador de Eventos (log "Aplicativo").
+    event_log: bool = True
+    #: Pisca o botão na barra de tarefas em alertas críticos.
+    flash_taskbar: bool = True
+    #: Impede a suspensão do PC enquanto o monitor estiver aberto.
+    prevent_sleep: bool = False
+    #: Barra de título com a cor do tema (Windows 11).
+    accent_title_bar: bool = True
+
+
+@dataclass(frozen=True)
 class AppSettings:
     poll_interval_seconds: float = 5.0
     #: Processos, portas e estatísticas de contêineres.
@@ -86,6 +112,14 @@ class AppSettings:
     inventory_interval_seconds: float = 60.0
     #: Contagem de atualizações pendentes (somente cache local).
     updates_interval_seconds: float = 1800.0
+    #: Auditoria de segurança, fail2ban, logins/sudo e SMART.
+    security_interval_seconds: float = 300.0
+    #: Verificações HTTP/TLS/TCP feitas a partir do Windows.
+    endpoint_interval_seconds: float = 60.0
+    #: Certificados que expiram em até N dias ficam em "Atenção".
+    cert_warning_days: float = 14.0
+    #: Latência: ICMP pela API do Windows, abertura de canal SSH ou desativada.
+    latency_probe: str = "auto"
     command_timeout_seconds: float = MAX_COMMAND_TIMEOUT
     connect_timeout_seconds: float = 5.0
     minimize_to_tray: bool = True
@@ -98,6 +132,7 @@ class AppSettings:
     history: HistorySettings = field(default_factory=HistorySettings)
     thresholds: ThresholdSettings = field(default_factory=ThresholdSettings)
     events: EventSettings = field(default_factory=EventSettings)
+    windows: WindowsSettings = field(default_factory=WindowsSettings)
 
 
 @dataclass(frozen=True)
@@ -109,6 +144,9 @@ class ServerConfig:
     key_file: Path | None = None
     key_passphrase_env: str | None = None
     password_env: str | None = None
+    #: Nome da credencial genérica no Gerenciador de Credenciais do Windows.
+    password_credential: str | None = None
+    key_passphrase_credential: str | None = None
     allow_agent: bool = True
     look_for_keys: bool = True
     host_key_policy: str = "accept-new"
@@ -123,6 +161,20 @@ class ServerConfig:
     libvirt: str = "auto"
     libvirt_uri: str = "qemu:///system"
     libvirt_sudo: bool = False
+    lxd: str = "auto"
+    lxd_sudo: bool = False
+    smart: str = "auto"
+    smart_sudo: bool = False
+    #: Auditoria de segurança (somente leitura).
+    security: bool = True
+    #: sudo -n para sshd -T, ufw/iptables/nft e fail2ban-client status.
+    security_sudo: bool = False
+    #: Permite banir/desbanir IPs no fail2ban pela interface (exige security_sudo).
+    security_actions: bool = False
+    endpoints: tuple[str, ...] = ()
+    #: Franquia mensal de tráfego do provedor, em GB (None = sem acompanhamento).
+    bandwidth_quota_gb: float | None = None
+    bandwidth_count: str = "tx"
     logs_sudo: bool = False
     network_sudo: bool = False
     process_actions: bool = False
@@ -136,11 +188,15 @@ class ServerConfig:
     def address(self) -> str:
         return f"{self.username}@{self.host}:{self.port}"
 
+    @property
+    def uses_password(self) -> bool:
+        return bool(self.password_env or self.password_credential)
+
     def resolve_password(self) -> str | None:
-        return _read_secret(self.password_env)
+        return _read_secret(self.password_env) or _read_credential(self.password_credential)
 
     def resolve_passphrase(self) -> str | None:
-        return _read_secret(self.key_passphrase_env)
+        return _read_secret(self.key_passphrase_env) or _read_credential(self.key_passphrase_credential)
 
 
 @dataclass(frozen=True)
@@ -288,23 +344,28 @@ def parse_config(raw: Any, *, base_dir: Path | None = None) -> Config:
 
 _SETTINGS_KEYS = {
     "poll_interval_seconds", "detail_interval_seconds", "inventory_interval_seconds",
-    "updates_interval_seconds", "command_timeout_seconds", "connect_timeout_seconds",
+    "updates_interval_seconds", "security_interval_seconds", "endpoint_interval_seconds",
+    "cert_warning_days", "latency_probe", "command_timeout_seconds", "connect_timeout_seconds",
     "minimize_to_tray", "start_minimized", "appearance_mode", "log_lines", "process_limit",
-    "known_hosts_file", "notifications", "history", "thresholds", "events",
+    "known_hosts_file", "notifications", "history", "thresholds", "events", "windows",
 }
 _HISTORY_KEYS = {"enabled", "retention_days", "file"}
-_THRESHOLD_KEYS = {"cpu_percent", "mem_percent", "disk_percent", "sustain_polls"}
+_THRESHOLD_KEYS = {"cpu_percent", "mem_percent", "disk_percent", "steal_percent", "latency_ms", "sustain_polls"}
 _EVENT_KEYS = {"priority", "limit", "since_hours"}
+_WINDOWS_KEYS = {"event_log", "flash_taskbar", "prevent_sleep", "accent_title_bar"}
 _NOTIFICATION_KEYS = {
     "enabled", "notify_on_recovery", "notify_on_disconnect", "alert_on_stop",
-    "cooldown_seconds", "app_id",
+    "cooldown_seconds", "app_id", "security_alerts", "notify_on_ssh_login",
 }
 _SERVER_KEYS = {
     "name", "host", "port", "username", "key_file", "key_passphrase_env", "password_env",
+    "password_credential", "key_passphrase_credential",
     "allow_agent", "look_for_keys", "host_key_policy", "use_sudo", "docker", "docker_sudo",
     "podman", "podman_sudo", "kubernetes", "kubectl_command", "kubectl_sudo", "libvirt",
-    "libvirt_uri", "libvirt_sudo", "logs_sudo", "network_sudo", "process_actions", "process_sudo",
-    "unit_types", "poll_interval_seconds", "critical_services", "exclude_services",
+    "libvirt_uri", "libvirt_sudo", "lxd", "lxd_sudo", "smart", "smart_sudo", "security", "security_sudo",
+    "security_actions", "endpoints", "bandwidth_quota_gb", "bandwidth_count", "logs_sudo", "network_sudo",
+    "process_actions", "process_sudo", "unit_types", "poll_interval_seconds", "critical_services",
+    "exclude_services",
 }
 _PLAINTEXT_SECRET_KEYS = {"password", "passphrase", "key_passphrase", "sudo_password"}
 
@@ -315,6 +376,20 @@ def _read_secret(env_name: str | None) -> str | None:
     value = os.environ.get(env_name)
     if value is None:
         log.warning("Variável de ambiente %s não definida", env_name)
+    return value
+
+
+def _read_credential(target: str | None) -> str | None:
+    if not target:
+        return None
+    from core.winapi import IS_WINDOWS, cred_read
+
+    if not IS_WINDOWS:
+        log.warning("Credencial %s ignorada: o Gerenciador de Credenciais só existe no Windows", target)
+        return None
+    value = cred_read(target)
+    if value is None:
+        log.warning("Credencial %s não encontrada no Gerenciador de Credenciais do Windows", target)
     return value
 
 
@@ -330,7 +405,8 @@ def _reject_unknown(obj: dict, allowed: set[str], ctx: str, errors: list[str]) -
             replacement = "password_env" if key == "password" else "key_passphrase_env"
             errors.append(
                 f"{ctx}: a chave '{key}' não é permitida — segredos em texto plano não são "
-                f"suportados. Use '{replacement}' com o nome de uma variável de ambiente (ou .env)."
+                f"suportados. Use '{replacement}' com o nome de uma variável de ambiente (ou .env) "
+                f"ou '{replacement.replace('_env', '_credential')}' (Gerenciador de Credenciais do Windows)."
             )
         elif key not in allowed and not key.startswith("_"):
             errors.append(f"{ctx}: chave desconhecida '{key}'.")
@@ -432,6 +508,9 @@ def _parse_settings(raw: Any, base_dir: Path | None, errors: list[str]) -> AppSe
         cooldown_seconds=_get_number(notif_raw, "cooldown_seconds", defaults_n.cooldown_seconds, 0, 86400,
                                      nctx, errors),
         app_id=_get(notif_raw, "app_id", str, None, nctx, errors),
+        security_alerts=_get(notif_raw, "security_alerts", bool, defaults_n.security_alerts, nctx, errors),
+        notify_on_ssh_login=_get_choice(notif_raw, "notify_on_ssh_login", LOGIN_NOTIFY,
+                                        defaults_n.notify_on_ssh_login, nctx, errors),
     )
 
     hist_raw, hctx = _get_section(raw, "history", _HISTORY_KEYS, ctx, errors)
@@ -449,6 +528,8 @@ def _parse_settings(raw: Any, base_dir: Path | None, errors: list[str]) -> AppSe
         cpu_percent=_get_number(thr_raw, "cpu_percent", defaults_t.cpu_percent, 0, 100, tctx, errors),
         mem_percent=_get_number(thr_raw, "mem_percent", defaults_t.mem_percent, 0, 100, tctx, errors),
         disk_percent=_get_number(thr_raw, "disk_percent", defaults_t.disk_percent, 0, 100, tctx, errors),
+        steal_percent=_get_number(thr_raw, "steal_percent", defaults_t.steal_percent, 0, 100, tctx, errors),
+        latency_ms=_get_number(thr_raw, "latency_ms", defaults_t.latency_ms, 0, 60000, tctx, errors),
         sustain_polls=int(_get_number(thr_raw, "sustain_polls", defaults_t.sustain_polls, 1, 100, tctx, errors)),
     )
 
@@ -459,6 +540,12 @@ def _parse_settings(raw: Any, base_dir: Path | None, errors: list[str]) -> AppSe
         limit=int(_get_number(ev_raw, "limit", defaults_e.limit, 10, 1000, ectx, errors)),
         since_hours=int(_get_number(ev_raw, "since_hours", defaults_e.since_hours, 1, 24 * 30, ectx, errors)),
     )
+
+    win_raw, wctx = _get_section(raw, "windows", _WINDOWS_KEYS, ctx, errors)
+    defaults_w = WindowsSettings()
+    windows = WindowsSettings(**{
+        key: _get(win_raw, key, bool, getattr(defaults_w, key), wctx, errors) for key in sorted(_WINDOWS_KEYS)
+    })
 
     defaults = AppSettings()
     known_hosts = _get(raw, "known_hosts_file", str, None, ctx, errors)
@@ -471,6 +558,13 @@ def _parse_settings(raw: Any, base_dir: Path | None, errors: list[str]) -> AppSe
                                                defaults.inventory_interval_seconds, 10, 86400, ctx, errors),
         updates_interval_seconds=_get_number(raw, "updates_interval_seconds", defaults.updates_interval_seconds,
                                              60, 86400 * 7, ctx, errors),
+        security_interval_seconds=_get_number(raw, "security_interval_seconds",
+                                              defaults.security_interval_seconds, 30, 86400, ctx, errors),
+        endpoint_interval_seconds=_get_number(raw, "endpoint_interval_seconds",
+                                              defaults.endpoint_interval_seconds, 10, 86400, ctx, errors),
+        cert_warning_days=_get_number(raw, "cert_warning_days", defaults.cert_warning_days, 1, 365, ctx, errors),
+        latency_probe=_get_choice(raw, "latency_probe", LATENCY_PROBES, defaults.latency_probe, ctx, errors),
+        windows=windows,
         process_limit=int(_get_number(raw, "process_limit", defaults.process_limit, 10, 5000, ctx, errors)),
         history=history,
         thresholds=thresholds,
@@ -525,6 +619,31 @@ def _parse_server(raw: Any, index: int, base_dir: Path | None, errors: list[str]
         except ValueError:
             errors.append(f"{ctx}.{key}: valor inválido {value!r}.")
 
+    endpoints = _get_patterns(raw, "endpoints", (), ctx, errors)
+    from core.endpoints import parse_endpoint
+
+    for index, endpoint in enumerate(endpoints):
+        try:
+            parse_endpoint(endpoint)
+        except ValueError as exc:
+            errors.append(f"{ctx}.endpoints[{index}]: {endpoint!r} inválido ({exc}).")
+
+    credentials = {}
+    for key, kind in (("password_credential", "password"), ("key_passphrase_credential", "passphrase")):
+        value = raw.get(key)
+        if value is True:
+            from core.winapi import credential_target
+
+            credentials[key] = credential_target(name or "?", kind)
+        elif value in (None, False):
+            credentials[key] = None
+        elif isinstance(value, str) and value.strip():
+            credentials[key] = value.strip()
+        else:
+            errors.append(f"{ctx}.{key}: use true (nome padrão) ou o nome da credencial.")
+
+    quota = _get_number(raw, "bandwidth_quota_gb", None, 0.001, 10_000_000, ctx, errors)
+
     unit_types = _get_patterns(raw, "unit_types", UNIT_TYPES, ctx, errors)
     invalid_types = [t for t in unit_types if t not in UNIT_TYPES]
     if invalid_types:
@@ -538,6 +657,8 @@ def _parse_server(raw: Any, index: int, base_dir: Path | None, errors: list[str]
         key_file=key_file,
         key_passphrase_env=_get(raw, "key_passphrase_env", str, None, ctx, errors),
         password_env=_get(raw, "password_env", str, None, ctx, errors),
+        password_credential=credentials.get("password_credential"),
+        key_passphrase_credential=credentials.get("key_passphrase_credential"),
         allow_agent=_get(raw, "allow_agent", bool, True, ctx, errors),
         look_for_keys=_get(raw, "look_for_keys", bool, True, ctx, errors),
         host_key_policy=_get_choice(raw, "host_key_policy", HOST_KEY_POLICIES, "accept-new", ctx, errors),
@@ -552,6 +673,16 @@ def _parse_server(raw: Any, index: int, base_dir: Path | None, errors: list[str]
         libvirt=_get_mode(raw, "libvirt", ctx, errors),
         libvirt_uri=libvirt_uri,
         libvirt_sudo=_get(raw, "libvirt_sudo", bool, False, ctx, errors),
+        lxd=_get_mode(raw, "lxd", ctx, errors),
+        lxd_sudo=_get(raw, "lxd_sudo", bool, False, ctx, errors),
+        smart=_get_mode(raw, "smart", ctx, errors),
+        smart_sudo=_get(raw, "smart_sudo", bool, False, ctx, errors),
+        security=_get(raw, "security", bool, True, ctx, errors),
+        security_sudo=_get(raw, "security_sudo", bool, False, ctx, errors),
+        security_actions=_get(raw, "security_actions", bool, False, ctx, errors),
+        endpoints=endpoints,
+        bandwidth_quota_gb=quota,
+        bandwidth_count=_get_choice(raw, "bandwidth_count", BANDWIDTH_COUNT, "tx", ctx, errors),
         logs_sudo=_get(raw, "logs_sudo", bool, False, ctx, errors),
         network_sudo=_get(raw, "network_sudo", bool, False, ctx, errors),
         process_actions=_get(raw, "process_actions", bool, False, ctx, errors),

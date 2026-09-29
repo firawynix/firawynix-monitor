@@ -19,26 +19,23 @@ import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageTk
 
 from core.models import ServiceStatus
+from ui import theme
+from ui.theme import BANNER_ERROR, BANNER_INFO, BANNER_WARN, CARD_BG, PANEL_BG, TEXT  # noqa: F401 - reexportados
 
 log = logging.getLogger(__name__)
 
 UI_FONT = "Segoe UI" if sys.platform == "win32" else "DejaVu Sans"
 MONO_FONT = "Consolas" if sys.platform == "win32" else "DejaVu Sans Mono"
 
-# Cores no formato (modo claro, modo escuro) aceito pelo CustomTkinter.
+# Cores no formato (modo claro, modo escuro) aceito pelo CustomTkinter. As de
+# status são semânticas (verde/amarelo/vermelho) e não mudam com o tema.
 GREEN = ("#1a7f37", "#3fb950")
 RED = ("#cf222e", "#ff6b6b")
 YELLOW = ("#9a6700", "#f2cc60")
 ORANGE = ("#bc4c00", "#f0883e")
-GRAY = ("#57606a", "#8b949e")
 PURPLE = ("#8250df", "#a371f7")
-BLUE = ("#1f6aa5", "#1f6aa5")
-TEXT = ("gray10", "gray90")
-CARD_BG = ("#f6f8fa", "#1c2128")
-PANEL_BG = ("#eaeef2", "#262c36")
-BANNER_WARN = ("#fff8c5", "#3d3000")
-BANNER_ERROR = ("#ffebe9", "#4a1319")
-BANNER_INFO = ("#ddf4ff", "#0c2d48")
+GRAY = theme.TEXT_SECONDARY
+CYAN = theme.ACCENT_BRIGHT
 
 STATUS_COLORS = {
     ServiceStatus.ACTIVE: GREEN,
@@ -127,7 +124,7 @@ def usage_color(percent: float | None) -> tuple[str, str]:
         return RED
     if percent >= 75:
         return YELLOW
-    return BLUE
+    return CYAN
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +156,7 @@ class Row:
 
 _TAG_COLORS = {
     "failed": RED, "activating": YELLOW, "degraded": ORANGE, "unknown": PURPLE,
-    "muted": ("#6e7781", "#9da7b3"), "stopped": ("#6e7781", "#9da7b3"),
+    "muted": theme.TEXT_MUTED, "stopped": theme.TEXT_MUTED,
     "warn": YELLOW, "error": RED,
 }
 _DOT_CACHE: dict[tuple, ImageTk.PhotoImage] = {}
@@ -183,9 +180,9 @@ def setup_table_style(widget: tk.Misc) -> None:
     if id(root) in _STYLE_READY:
         return
     _STYLE_READY.add(id(root))
-    dark = mode_index() == 1
-    bg, fg = ("#1c2128", "#e6edf3") if dark else ("#ffffff", "#1f2328")
-    heading_bg, hover = ("#262c36", "#30363d") if dark else ("#eaeef2", "#d0d7de")
+    index = mode_index()
+    bg, fg = CARD_BG[index], TEXT[index]
+    heading_bg, hover = PANEL_BG[index], theme.PANEL_HOVER[index]
     scaling = ctk.ScalingTracker.get_widget_scaling(widget)
     style = ttk.Style(root)
     if style.theme_use() != "clam":
@@ -194,7 +191,7 @@ def setup_table_style(widget: tk.Misc) -> None:
                     rowheight=int(26 * scaling), borderwidth=0, relief="flat", font=(UI_FONT, 10))
     style.configure("Data.Treeview.Heading", background=heading_bg, foreground=fg, relief="flat", borderwidth=0,
                     font=(UI_FONT, 10, "bold"), padding=(8, 5))
-    style.map("Data.Treeview", background=[("selected", "#1f6aa5")], foreground=[("selected", "#ffffff")])
+    style.map("Data.Treeview", background=[("selected", theme.ACCENT[index])], foreground=[("selected", "#ffffff")])
     style.map("Data.Treeview.Heading", background=[("active", hover)])
     style.layout("Data.Treeview", [("Data.Treeview.treearea", {"sticky": "nswe"})])
     # Sem o indicador de expandir/recolher (as linhas não têm filhos).
@@ -247,7 +244,8 @@ class DataTable(ctk.CTkFrame):
                               command=lambda c=column.id: self.sort_by(c))
             self.tree.column(column_id, width=column.width, minwidth=50, stretch=column.stretch,
                              anchor=column.anchor)
-        scrollbar = ctk.CTkScrollbar(self, command=self.tree.yview)
+        # Altura mínima pequena: a barra estica com a tabela (o padrão, 200 px, forçaria tabelas baixas a crescer).
+        scrollbar = ctk.CTkScrollbar(self, command=self.tree.yview, height=40)
         self.tree.configure(yscrollcommand=scrollbar.set)
         self.tree.grid(row=0, column=0, sticky="nsew", padx=(8, 0), pady=8)
         scrollbar.grid(row=0, column=1, sticky="ns", padx=(2, 6), pady=8)
@@ -357,9 +355,9 @@ class DataTable(ctk.CTkFrame):
         if iid:
             self.tree.selection_set(iid)
             self.tree.focus(iid)
-        dark = mode_index() == 1
-        menu = tk.Menu(self, tearoff=0, bg="#262c36" if dark else "#ffffff", fg="#e6edf3" if dark else "#1f2328",
-                       activebackground="#1f6aa5", activeforeground="#ffffff", bd=0)
+        index = mode_index()
+        menu = tk.Menu(self, tearoff=0, bg=PANEL_BG[index], fg=TEXT[index], activebackground=theme.ACCENT[index],
+                       activeforeground="#ffffff", bd=0)
         items = self._menu_items() if (self._menu_items and iid) else []
         for label, command in items:
             if label == "-":
@@ -454,7 +452,7 @@ class MetricCard(ctk.CTkFrame):
             self._note.grid_remove()
         if self._bar is not None:
             self._bar.set(max(0.0, min(1.0, fraction or 0.0)))
-            self._bar.configure(progress_color=color or BLUE)
+            self._bar.configure(progress_color=color or CYAN)
 
 
 class CountsCard(ctk.CTkFrame):
@@ -488,9 +486,10 @@ class CountsCard(ctk.CTkFrame):
 class InfoGrid(ctk.CTkFrame):
     """Pares rótulo/valor em colunas (aba Sistema)."""
 
-    def __init__(self, master, columns: int = 2) -> None:
+    def __init__(self, master, columns: int = 2, wraplength: int = 420) -> None:
         super().__init__(master, corner_radius=12, fg_color=CARD_BG)
         self._columns = columns
+        self._wraplength = wraplength
         self._labels: dict[str, ctk.CTkLabel] = {}
         for column in range(columns):
             self.grid_columnconfigure(column * 2 + 1, weight=1)
@@ -501,7 +500,7 @@ class InfoGrid(ctk.CTkFrame):
             if label not in self._labels:
                 ctk.CTkLabel(self, text=label, text_color=GRAY, anchor="w").grid(
                     row=row, column=column * 2, sticky="w", padx=(14, 10), pady=3)
-                value_label = ctk.CTkLabel(self, text="", anchor="w", justify="left", wraplength=420)
+                value_label = ctk.CTkLabel(self, text="", anchor="w", justify="left", wraplength=self._wraplength)
                 value_label.grid(row=row, column=column * 2 + 1, sticky="w", padx=(0, 14), pady=3)
                 self._labels[label] = value_label
             self._labels[label].configure(text=value, text_color=color or TEXT)
@@ -558,13 +557,14 @@ class ConfirmDialog(ctk.CTkToplevel):
             ctk.CTkButton(buttons, text=cancel_text, width=110, fg_color="transparent", border_width=1,
                           text_color=TEXT, command=self._cancel).pack(side="right", padx=(8, 0))
         ctk.CTkButton(buttons, text=confirm_text, width=120, command=self._confirm,
-                      fg_color=RED if danger else BLUE,
-                      hover_color=("#a40e26", "#d9363e") if danger else None).pack(side="right")
+                      fg_color=RED if danger else theme.ACCENT,
+                      hover_color=("#a40e26", "#d9363e") if danger else theme.ACCENT_HOVER).pack(side="right")
 
         self.bind("<Return>", lambda _e: self._confirm())
         self.bind("<Escape>", lambda _e: self._cancel())
         self.protocol("WM_DELETE_WINDOW", self._cancel)
         center_on(self, master)
+        self.after(250, lambda: theme.style_window(self))
 
     def show(self) -> bool:
         self.after(60, lambda: make_modal(self))
@@ -624,7 +624,8 @@ class TextViewer(ctk.CTkToplevel):
             self._reload_btn = ctk.CTkButton(controls, text="Atualizar", width=96, command=self.reload)
             self._reload_btn.pack(side="left", padx=(0, 8))
             self.bind("<F5>", lambda _e: self.reload())
-        ctk.CTkButton(controls, text="Copiar", width=80, fg_color=("gray75", "gray30"), text_color=TEXT,
+        ctk.CTkButton(controls, text="Copiar", width=80, fg_color=theme.NEUTRAL, hover_color=theme.NEUTRAL_HOVER,
+                      text_color=TEXT,
                       command=self._copy).pack(side="left", padx=(0, 8))
         ctk.CTkButton(controls, text="Fechar", width=80, fg_color="transparent", border_width=1, text_color=TEXT,
                       command=self.destroy).pack(side="left")
@@ -637,6 +638,7 @@ class TextViewer(ctk.CTkToplevel):
 
         self.bind("<Escape>", lambda _e: self.destroy())
         center_on(self, master)
+        self.after(250, lambda: theme.style_window(self))
         self.after(60, lambda: make_modal(self))
         if fetch is not None:
             self.reload()
@@ -702,12 +704,15 @@ class TextViewer(ctk.CTkToplevel):
 # Gráfico de linhas
 # ---------------------------------------------------------------------------
 
-#: Paleta categórica validada (slots 1–3 passam em todos os pares, nos dois modos).
-SERIES_COLORS = (("#2a78d6", "#3987e5"), ("#eb6834", "#d95926"), ("#1baf7a", "#199e70"))
+#: Paleta categórica do tema ciano, validada com o validador de paletas (todos os
+#: pares, contra as superfícies dos cartões): claro #f9fcfd — pior ΔE daltonismo
+#: 17,1, visão normal 23,2; escuro #102229 — 8,2 e 15,3; contraste >= 3:1 em ambos.
+#: Ciano (slot 1) é a cor da marca; laranja e violeta vêm da paleta de referência.
+SERIES_COLORS = (("#0891b2", "#0891b2"), ("#eb6834", "#d95926"), ("#4a3aa7", "#9085e9"))
 _CHART_INK = {
     # superfície, grade, linha de base, texto secundário, texto discreto, texto principal, fundo do tooltip
-    0: ("#f6f8fa", "#e1e4e8", "#c3c9d0", "#57606a", "#6e7781", "#1f2328", "#ffffff"),
-    1: ("#1c2128", "#2a3039", "#3a414b", "#b1bac4", "#8b949e", "#e6edf3", "#262c36"),
+    0: (CARD_BG[0], "#dfeaee", "#b8cdd3", theme.TEXT_SECONDARY[0], theme.TEXT_MUTED[0], TEXT[0], "#ffffff"),
+    1: (CARD_BG[1], "#1b343d", "#2c4c57", "#a9c1c8", theme.TEXT_MUTED[1], TEXT[1], PANEL_BG[1]),
 }
 
 
@@ -738,9 +743,11 @@ class LineChart(ctk.CTkFrame):
     MARGIN_LEFT, MARGIN_RIGHT, MARGIN_TOP, MARGIN_BOTTOM = 62, 16, 34, 26
 
     def __init__(self, master, title: str, formatter: Callable[[float], str], *,
-                 fixed_max: float | None = None, height: int = 200) -> None:
+                 fixed_max: float | None = None, height: int = 200, binary: bool = False) -> None:
         super().__init__(master, corner_radius=12, fg_color=CARD_BG)
         self._title = title
+        #: Valores em bytes: marcas do eixo em múltiplos de 1024 (2,5 MB/s, 5 MB/s...).
+        self._binary = binary
         self._fmt = formatter
         self._fixed_max = fixed_max
         self._series: list[Series] = []
@@ -782,10 +789,13 @@ class LineChart(ctk.CTkFrame):
         values = [v for s in self._series for v in s.values if v is not None]
         t1 = time.time()
         t0 = t1 - self._window
-        y_max = self._fixed_max or _nice_ceiling(max(values) if values else 1.0)
+        if self._fixed_max:
+            y_max, step = self._fixed_max, self._fixed_max / 4
+        else:
+            y_max, step = _nice_scale(max(values) if values else 1.0, 1024 if self._binary else 10)
         self._plot = _Plot(x0, x1, y0, y1, t0, t1, y_max, self._timestamps)
 
-        for tick in _ticks(y_max):
+        for tick in _ticks(y_max, step):
             y = y1 - (y1 - y0) * tick / y_max
             c.create_line(x0, y, x1, y, fill=baseline if tick == 0 else grid, width=1)
             c.create_text(x0 - 8, y, text=self._fmt(tick), anchor="e", fill=muted, font=font)
@@ -889,8 +899,32 @@ def _nice_ceiling(value: float) -> float:
     return nice * 10 ** exponent
 
 
-def _ticks(y_max: float, count: int = 4) -> list[float]:
-    return [y_max * i / count for i in range(count + 1)]
+def _nice_scale(value: float, base: int = 10) -> tuple[float, float]:
+    """(máximo, passo) com 3 a 5 intervalos "redondos" que cobrem ``value``.
+
+    ``base=1024`` escolhe o passo na unidade binária do valor (KB, MB...) para que
+    as marcas formatadas em bytes fiquem redondas (2,5 MB/s em vez de 2,4 MB/s).
+    """
+    if value <= 0:
+        return 1.0, 0.25
+    unit = 1.0
+    if base == 1024:
+        while value / unit >= 1024:
+            unit *= 1024
+    scaled = value / unit
+    best = None
+    for count in (4, 5, 3):
+        step = _nice_ceiling(scaled / count)
+        if best is None or step * count < best[0] * best[1] - 1e-9:
+            best = (step, count)
+    step, count = best
+    return step * count * unit, step * unit
+
+
+def _ticks(y_max: float, step: float | None = None) -> list[float]:
+    step = step or y_max / 4
+    count = max(1, round(y_max / step))
+    return [step * i for i in range(count + 1)]
 
 
 def _time_ticks(t0: float, t1: float, count: int = 5) -> list[float]:

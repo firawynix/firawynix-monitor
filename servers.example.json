@@ -1,10 +1,14 @@
 {
-  "_comment": "Copie para servers.json. Segredos NUNCA ficam aqui: use password_env/key_passphrase_env (variáveis de ambiente ou .env).",
+  "_comment": "Copie para servers.json. Segredos NUNCA ficam aqui: use password_env/key_passphrase_env (variáveis de ambiente ou .env) ou password_credential/key_passphrase_credential (Gerenciador de Credenciais do Windows).",
   "settings": {
     "poll_interval_seconds": 5,
     "detail_interval_seconds": 15,
     "inventory_interval_seconds": 60,
     "updates_interval_seconds": 1800,
+    "security_interval_seconds": 300,
+    "endpoint_interval_seconds": 60,
+    "cert_warning_days": 14,
+    "latency_probe": "auto",
     "command_timeout_seconds": 5,
     "connect_timeout_seconds": 5,
     "minimize_to_tray": true,
@@ -17,12 +21,16 @@
       "notify_on_recovery": true,
       "notify_on_disconnect": true,
       "alert_on_stop": false,
-      "cooldown_seconds": 120
+      "cooldown_seconds": 120,
+      "security_alerts": true,
+      "notify_on_ssh_login": "root"
     },
     "thresholds": {
       "cpu_percent": 90,
       "mem_percent": 90,
       "disk_percent": 90,
+      "steal_percent": 10,
+      "latency_ms": 0,
       "sustain_polls": 3
     },
     "history": {
@@ -33,6 +41,12 @@
       "priority": "err",
       "limit": 100,
       "since_hours": 24
+    },
+    "windows": {
+      "event_log": true,
+      "flash_taskbar": true,
+      "prevent_sleep": false,
+      "accent_title_bar": true
     }
   },
   "servers": [
@@ -47,6 +61,11 @@
       "docker": "auto",
       "docker_sudo": false,
       "network_sudo": false,
+      "security_sudo": true,
+      "security_actions": true,
+      "endpoints": ["https://loja.exemplo.com.br/", "https://api.exemplo.com.br/health", "tls://mail.exemplo.com.br:993"],
+      "bandwidth_quota_gb": 1000,
+      "bandwidth_count": "tx",
       "critical_services": ["nginx", "postgresql*", "redis-server", "docker:shop-*"],
       "exclude_services": ["systemd-*", "getty@*", "user@*"]
     },
@@ -66,17 +85,20 @@
       "username": "monitor",
       "libvirt": "on",
       "libvirt_uri": "qemu:///system",
+      "lxd": "auto",
+      "smart_sudo": true,
       "process_actions": true,
-      "critical_services": ["libvirtd", "vm:*"]
+      "critical_services": ["libvirtd", "vm:*", "lxd:gitea"]
     },
     {
       "name": "staging",
       "host": "staging.example.com",
       "port": 2222,
       "username": "deploy",
-      "password_env": "STAGING_SSH_PASSWORD",
+      "password_credential": true,
       "host_key_policy": "strict",
       "docker": "off",
+      "smart": "off",
       "unit_types": ["service", "timer"],
       "poll_interval_seconds": 10
     }

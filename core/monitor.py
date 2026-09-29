@@ -7,10 +7,14 @@ Fluxo de dados::
 Cada ciclo executa, em paralelo (canais SSH distintos na mesma conexão), os
 coletores que estiverem "vencidos":
 
-* rápido (todo ciclo): unidades systemd, contêineres, pods, VMs, métricas;
+* rápido (todo ciclo): unidades systemd, contêineres, pods, VMs, LXD, métricas
+  e latência (ICMP pela API do Windows ou tempo de abertura de canal SSH);
 * detalhes (``detail_interval_seconds``): processos, portas, stats de contêineres;
-* inventário (``inventory_interval_seconds``): sistema, timers, cron, eventos;
-* atualizações (``updates_interval_seconds``): pacotes pendentes.
+* inventário (``inventory_interval_seconds``): sistema, VPS, timers, cron, eventos;
+* segurança (``security_interval_seconds``): auditoria, fail2ban, logins, sudo, SMART;
+* atualizações (``updates_interval_seconds``): pacotes pendentes;
+* endpoints (``endpoint_interval_seconds``): HTTP/TLS/TCP a partir do Windows, em
+  segundo plano (um site lento nunca atrasa a coleta SSH).
 
 Cada comando continua limitado a 5 s. A interface nunca chama SSH diretamente:
 ações e logs rodam em um ``ThreadPoolExecutor`` e devolvem ``Future``/eventos.
@@ -31,6 +35,10 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Protocol
 
 from config.settings import AppSettings, Config, NotificationSettings, ServerConfig, ThresholdSettings, user_data_dir
+from core import security as security_rules
+from core import winapi
+from core.alerts import HostAlertPolicy
+from core.endpoints import check_endpoint, parse_endpoint
 from core.history import HistoryStore
 from core.models import (
     ActionOutcome,
@@ -40,6 +48,8 @@ from core.models import (
     ConnectionEvent,
     ConnectionState,
     CronEntry,
+    EndpointResult,
+    Fail2banJail,
     HostMetrics,
     HostSnapshot,
     JournalEntry,
@@ -48,17 +58,22 @@ from core.models import (
     ProcessInfo,
     RuntimeResult,
     RuntimeState,
+    SecurityRaw,
     ServiceAction,
     ServiceAlertEvent,
     ServiceInfo,
     ServiceKind,
     ServiceStatus,
+    SmartReport,
     SnapshotEvent,
+    SshLoginReport,
     Stack,
+    SudoEvent,
     SystemInfo,
     ThresholdAlertEvent,
     TimerInfo,
     UpdatesInfo,
+    VpsInfo,
 )
 from core.ssh_client import (
     SSHAuthError,
@@ -81,6 +96,11 @@ EXPECTED_STOP_WINDOW = 90.0
 THRESHOLD_HYSTERESIS = 5.0
 #: Coletores em paralelo por servidor (sshd permite 10 sessões por conexão).
 COLLECTOR_WORKERS = 4
+#: Endpoints verificados em paralelo (a partir do Windows).
+ENDPOINT_WORKERS = 6
+#: No modo "auto", após N pings ICMP sem resposta usa só a latência do SSH.
+ICMP_MAX_FAILURES = 3
+ICMP_RETRY_POLLS = 120
 
 _FAST_TASKS = {"units", "metrics"}
 
@@ -98,6 +118,7 @@ class HostClient(Protocol):
     def container_stats(self, runtime: ServiceKind) -> dict[str, tuple[float | None, int | None]]: ...
     def list_pods(self) -> RuntimeResult: ...
     def list_vms(self) -> RuntimeResult: ...
+    def list_lxd(self) -> RuntimeResult: ...
     def host_metrics(self) -> HostMetrics: ...
     def processes(self) -> list[ProcessInfo]: ...
     def network(self) -> NetworkInfo: ...
@@ -105,8 +126,15 @@ class HostClient(Protocol):
     def cron(self) -> list[CronEntry]: ...
     def journal_events(self, priority: str, limit: int, since_hours: int) -> list[JournalEntry]: ...
     def system_info(self) -> tuple[SystemInfo, dict[str, float]]: ...
-    def ssh_failed_logins(self) -> int | None: ...
     def updates(self) -> UpdatesInfo | None: ...
+    def vps_info(self) -> VpsInfo: ...
+    def smart(self) -> SmartReport: ...
+    def security_raw(self) -> SecurityRaw: ...
+    def fail2ban_status(self) -> tuple[tuple[Fail2banJail, ...], str]: ...
+    def ssh_logins(self) -> SshLoginReport: ...
+    def sudo_log(self) -> tuple[SudoEvent, ...]: ...
+    def take_rtt(self) -> float | None: ...
+    def fail2ban_action(self, jail: str, ip: str, ban: bool) -> ActionResult: ...
     def service_action(self, service: ServiceInfo, action: ServiceAction) -> ActionResult: ...
     def stack_action(self, stack: Stack, action: ServiceAction) -> ActionResult: ...
     def kill_process(self, pid: int, force: bool) -> ActionResult: ...
@@ -157,13 +185,14 @@ class ExponentialBackoff:
 # Regras de criticidade e alertas
 # ---------------------------------------------------------------------------
 
-_KIND_PREFIXES = {kind.value for kind in ServiceKind} | {"kubernetes", "libvirt"}
-_PREFIX_ALIASES = {"kubernetes": ServiceKind.KUBERNETES.value, "libvirt": ServiceKind.LIBVIRT.value}
+_KIND_PREFIXES = {kind.value for kind in ServiceKind} | {"kubernetes", "libvirt", "incus", "lxc"}
+_PREFIX_ALIASES = {"kubernetes": ServiceKind.KUBERNETES.value, "libvirt": ServiceKind.LIBVIRT.value,
+                   "incus": ServiceKind.LXD.value, "lxc": ServiceKind.LXD.value}
 
 
 def matches_patterns(service: ServiceInfo, patterns: Iterable[str]) -> bool:
     """Padrões glob (``nginx*``), opcionalmente prefixados pelo tipo
-    (``docker:web-*``, ``podman:*``, ``k8s:prod/*``, ``vm:db*``).
+    (``docker:web-*``, ``podman:*``, ``k8s:prod/*``, ``vm:db*``, ``lxd:web*``).
 
     Para unidades systemd o sufixo ``.service`` é opcional: ``nginx`` casa com
     ``nginx.service``.
@@ -242,39 +271,46 @@ class ThresholdPolicy:
     def active(self) -> tuple[str, ...]:
         return tuple(self._active.values())
 
-    def evaluate(self, server: str, metrics: HostMetrics | None) -> list[ThresholdAlertEvent]:
+    def evaluate(self, server: str, metrics: HostMetrics | None,
+                 latency: float | None = None) -> list[ThresholdAlertEvent]:
         if metrics is None:
             return []
         t = self.thresholds
-        checks: list[tuple[str, str, float | None, float, int]] = [
-            ("cpu", "CPU", metrics.cpu_percent, t.cpu_percent, t.sustain_polls),
-            ("mem", "Memória", metrics.mem_percent, t.mem_percent, t.sustain_polls),
+        checks: list[tuple[str, str, float | None, float, int, str]] = [
+            ("cpu", "CPU", metrics.cpu_percent, t.cpu_percent, t.sustain_polls, "%"),
+            ("mem", "Memória", metrics.mem_percent, t.mem_percent, t.sustain_polls, "%"),
+            ("steal", "CPU steal", metrics.cpu_steal, t.steal_percent, t.sustain_polls, "%"),
+            ("latency", "Latência", latency, t.latency_ms, t.sustain_polls, " ms"),
         ]
         # Disco não oscila como CPU: alerta na primeira leitura acima do limite.
-        checks += [(f"disk:{d.mount}", f"Disco {d.mount}", d.use_percent, t.disk_percent, 1) for d in metrics.disks]
+        checks += [(f"disk:{d.mount}", f"Disco {d.mount}", d.use_percent, t.disk_percent, 1, "%")
+                   for d in metrics.disks]
         events = []
         seen = set()
-        for metric, label, value, limit, sustain in checks:
+        for metric, label, value, limit, sustain, unit in checks:
             seen.add(metric)
             if not limit or value is None:
                 continue
+            hysteresis = THRESHOLD_HYSTERESIS if unit == "%" else limit * 0.1
             if value >= limit:
                 self._streak[metric] += 1
                 if self._streak[metric] >= sustain and metric not in self._active:
                     events.append(ThresholdAlertEvent(server=server, metric=metric, label=label,
-                                                      value=value, threshold=limit))
+                                                      value=value, threshold=limit, unit=unit))
                 if metric in self._active or self._streak[metric] >= sustain:
-                    self._active[metric] = f"{label} {value:.0f}%"
+                    self._active[metric] = f"{label} {value:.0f}{unit}"
             else:
                 self._streak[metric] = 0
-                if metric in self._active and value < limit - THRESHOLD_HYSTERESIS:
+                if metric in self._active and value < limit - hysteresis:
                     del self._active[metric]
                     events.append(ThresholdAlertEvent(server=server, metric=metric, label=label,
-                                                      value=value, threshold=limit, recovered=True))
+                                                      value=value, threshold=limit, recovered=True, unit=unit))
                 elif metric in self._active:
-                    self._active[metric] = f"{label} {value:.0f}%"
+                    self._active[metric] = f"{label} {value:.0f}{unit}"
         for gone in set(self._active) - seen:  # disco desmontado
             del self._active[gone]
+        if latency is None:
+            self._streak["latency"] = 0
         return events
 
 
@@ -298,13 +334,24 @@ class _Latest:
     events: list[JournalEntry] = dataclasses.field(default_factory=list)
     system: SystemInfo | None = None
     inodes: dict[str, float] = dataclasses.field(default_factory=dict)
-    ssh_failures: int | None = None
     updates: UpdatesInfo | None = None
+    vps: VpsInfo | None = None
+    smart: SmartReport | None = None
+    security_raw: SecurityRaw | None = None
+    fail2ban: tuple[tuple[Fail2banJail, ...], str] | None = None
+    logins: SshLoginReport | None = None
+    sudo: tuple[SudoEvent, ...] = ()
+    endpoints: list[EndpointResult] = dataclasses.field(default_factory=list)
+    latency_ms: float | None = None
+    latency_method: str = ""
     detail_at: float | None = None
     inventory_at: float | None = None
+    security_at: float | None = None
+    endpoints_at: float | None = None
 
 
-_RUNTIME_KINDS = (ServiceKind.DOCKER, ServiceKind.PODMAN, ServiceKind.KUBERNETES, ServiceKind.LIBVIRT)
+_RUNTIME_KINDS = (ServiceKind.DOCKER, ServiceKind.PODMAN, ServiceKind.KUBERNETES, ServiceKind.LIBVIRT,
+                  ServiceKind.LXD)
 
 
 class ServerMonitor:
@@ -322,17 +369,25 @@ class ServerMonitor:
         self.interval = server.poll_interval_seconds or settings.poll_interval_seconds
         self.policy = AlertPolicy(settings.notifications)
         self.thresholds = ThresholdPolicy(settings.thresholds)
+        self.host_alerts = HostAlertPolicy(server, settings.notifications)
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         self._pool = ThreadPoolExecutor(max_workers=COLLECTOR_WORKERS,
                                         thread_name_prefix=f"collect-{server.name}")
+        # Endpoints e ICMP não usam SSH: pool próprio para não disputar canais.
+        self._probe_pool = ThreadPoolExecutor(max_workers=ENDPOINT_WORKERS,
+                                              thread_name_prefix=f"probe-{server.name}")
+        self._endpoint_future: Future[list[EndpointResult]] | None = None
+        self._endpoint_specs = [parse_endpoint(e) for e in server.endpoints]
+        self._icmp_failures = 0
+        self._icmp_skip = 0
         self._backoff = ExponentialBackoff(base=1.0, maximum=60.0)
         # Credenciais/host key erradas: espaçar bem as tentativas (evita fail2ban).
         self._auth_backoff = ExponentialBackoff(base=30.0, maximum=600.0)
         self._previous: dict[str, ServiceInfo] | None = None
         self._latest = _Latest()
-        self._due = {"detail": 0.0, "inventory": 0.0, "updates": 0.0}
+        self._due = {"detail": 0.0, "inventory": 0.0, "updates": 0.0, "security": 0.0, "endpoints": 0.0}
         self._runtime_skip: dict[ServiceKind, int] = defaultdict(int)
         self._consecutive_timeouts = 0
         self.state = ConnectionState.STOPPED
@@ -355,6 +410,7 @@ class ServerMonitor:
         if self._thread is not None:
             self._thread.join(timeout)
         self._pool.shutdown(wait=False, cancel_futures=True)
+        self._probe_pool.shutdown(wait=False, cancel_futures=True)
         try:
             self.client.close()
         except Exception:  # noqa: BLE001
@@ -368,6 +424,16 @@ class ServerMonitor:
 
     def set_interval(self, seconds: float) -> None:
         self.interval = seconds
+        self._wake.set()
+
+    def reconnect(self) -> None:
+        """Reconecta já (ex.: credencial atualizada), sem esperar o backoff de autenticação."""
+        self._backoff.reset()
+        self._auth_backoff.reset()
+        try:
+            self.client.close()
+        except Exception:  # noqa: BLE001
+            log.debug("Erro ao fechar cliente", exc_info=True)
         self._wake.set()
 
     def _sleep(self, seconds: float) -> None:
@@ -449,8 +515,12 @@ class ServerMonitor:
                 tasks[kind.value] = (lambda k=kind: client.list_containers(k))
             elif kind is ServiceKind.KUBERNETES:
                 tasks[kind.value] = client.list_pods
+            elif kind is ServiceKind.LXD:
+                tasks[kind.value] = client.list_lxd
             else:
                 tasks[kind.value] = client.list_vms
+        if self._icmp_enabled():
+            tasks["icmp"] = (lambda: winapi.icmp_ping(self.server.host, 1000))
 
         detail_due = now >= self._due["detail"]
         if detail_due:
@@ -467,14 +537,50 @@ class ServerMonitor:
             self._due["inventory"] = now + settings.inventory_interval_seconds
             events = settings.events
             tasks["system"] = client.system_info
-            tasks["ssh_failures"] = client.ssh_failed_logins
+            tasks["vps"] = client.vps_info
             tasks["timers"] = client.timers
             tasks["cron"] = client.cron
             tasks["events"] = (lambda: client.journal_events(events.priority, events.limit, events.since_hours))
         if now >= self._due["updates"]:
             self._due["updates"] = now + settings.updates_interval_seconds
             tasks["updates"] = client.updates
+        if now >= self._due["security"]:
+            self._due["security"] = now + settings.security_interval_seconds
+            server = self.server
+            if server.security:
+                tasks["security"] = client.security_raw
+                tasks["ssh_logins"] = client.ssh_logins
+                tasks["sudo_log"] = client.sudo_log
+                if server.security_sudo or server.username == "root":
+                    tasks["fail2ban"] = client.fail2ban_status
+            if server.smart != "off":
+                tasks["smart"] = client.smart
+        if self._endpoint_specs and now >= self._due["endpoints"] and (
+                self._endpoint_future is None or self._endpoint_future.done()):
+            self._due["endpoints"] = now + settings.endpoint_interval_seconds
+            self._endpoint_future = self._probe_pool.submit(self._check_endpoints)
         return tasks
+
+    def _icmp_enabled(self) -> bool:
+        probe = self.settings.latency_probe
+        if probe not in ("auto", "icmp") or not winapi.IS_WINDOWS:
+            return False
+        if probe == "auto" and self._icmp_failures >= ICMP_MAX_FAILURES:
+            self._icmp_skip -= 1
+            if self._icmp_skip > 0:
+                return False
+            self._icmp_failures = ICMP_MAX_FAILURES - 1  # uma nova tentativa
+        return True
+
+    def _check_endpoints(self) -> list[EndpointResult]:
+        timeout = min(self.settings.command_timeout_seconds, 5.0)
+        warning = self.settings.cert_warning_days
+        # O modo demonstração fornece o próprio verificador (sem acessar a internet).
+        check = getattr(self.client, "check_endpoint", check_endpoint)
+        with ThreadPoolExecutor(max_workers=min(ENDPOINT_WORKERS, len(self._endpoint_specs)),
+                                thread_name_prefix=f"endpoint-{self.server.name}") as pool:
+            return list(pool.map(lambda spec: check(spec, timeout=timeout, cert_warning_days=warning),
+                                 self._endpoint_specs))
 
     def _runtime_mode(self, kind: ServiceKind) -> str:
         return {
@@ -482,6 +588,7 @@ class ServerMonitor:
             ServiceKind.PODMAN: self.server.podman,
             ServiceKind.KUBERNETES: self.server.kubernetes,
             ServiceKind.LIBVIRT: self.server.libvirt,
+            ServiceKind.LXD: self.server.lxd,
         }[kind]
 
     def _collect(self) -> HostSnapshot:
@@ -509,6 +616,13 @@ class ServerMonitor:
                 warnings.append(f"Falha na coleta '{_TASK_LABELS.get(name, name)}': {exc}")
         if connection_error is not None:
             raise connection_error
+        future = self._endpoint_future
+        if future is not None and future.done() and "endpoints" not in results:
+            self._endpoint_future = None
+            try:
+                results["endpoints"] = future.result()
+            except Exception:  # noqa: BLE001
+                log.exception("[%s] verificação de endpoints falhou", self.server.name)
 
         self._consecutive_timeouts = self._consecutive_timeouts + 1 if timed_out & _FAST_TASKS else 0
         if self._consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
@@ -550,13 +664,64 @@ class ServerMonitor:
             latest.inventory_at = now
         if isinstance(results.get("system"), tuple):
             latest.system, latest.inodes = results["system"]
-        if "ssh_failures" in results and not isinstance(results["ssh_failures"], Exception):
-            latest.ssh_failures = results["ssh_failures"]
+        if isinstance(results.get("vps"), VpsInfo):
+            latest.vps = results["vps"]
+        if "security" in results or "smart" in results:
+            latest.security_at = now
+        for name, kind in (("smart", SmartReport), ("security", SecurityRaw), ("ssh_logins", SshLoginReport)):
+            if isinstance(results.get(name), kind):
+                setattr(latest, {"security": "security_raw", "ssh_logins": "logins"}.get(name, name), results[name])
+        if isinstance(results.get("fail2ban"), tuple):
+            latest.fail2ban = results["fail2ban"]
+        if isinstance(results.get("sudo_log"), tuple):
+            latest.sudo = results["sudo_log"]
+        if isinstance(results.get("endpoints"), list):
+            latest.endpoints = results["endpoints"]
+            latest.endpoints_at = now
+        self._apply_latency(results)
         for name in ("timers", "cron", "events"):
             if isinstance(results.get(name), list):
                 setattr(latest, name, results[name])
         if "updates" in results and not isinstance(results["updates"], Exception):
             latest.updates = results["updates"]
+
+    def _apply_latency(self, results: dict[str, Any]) -> None:
+        probe = self.settings.latency_probe
+        rtt = self.client.take_rtt()
+        latest = self._latest
+        if probe == "off":
+            latest.latency_ms, latest.latency_method = None, ""
+            return
+        if "icmp" in results:
+            icmp = results["icmp"]
+            if isinstance(icmp, float):
+                self._icmp_failures = 0
+                latest.latency_ms, latest.latency_method = icmp, "ICMP"
+                return
+            self._icmp_failures += 1
+            if self._icmp_failures >= ICMP_MAX_FAILURES:
+                self._icmp_skip = ICMP_RETRY_POLLS
+                log.info("[%s] sem resposta ICMP; usando a latência medida pelo SSH", self.server.name)
+            if probe == "icmp":
+                latest.latency_ms, latest.latency_method = None, "ICMP sem resposta"
+                return
+        if rtt is not None and probe != "icmp":
+            latest.latency_ms, latest.latency_method = rtt, "SSH"
+
+    def _security_report(self, system: SystemInfo | None):
+        latest = self._latest
+        raw = latest.security_raw
+        if raw is None:
+            return None
+        if latest.fail2ban is not None:
+            jails, error = latest.fail2ban
+            raw = dataclasses.replace(raw, fail2ban=jails, fail2ban_error=error)
+        logins = latest.logins
+        if logins is not None and system is not None and system.journal_access is False:
+            logins = dataclasses.replace(logins, complete=False)
+        return security_rules.evaluate(
+            raw, ssh_user=self.server.username, logins=logins, sudo_events=latest.sudo, network=latest.network,
+            updates=latest.updates, system=system, vps=latest.vps, monitor_uses_password=self.server.uses_password)
 
     def _build_snapshot(self, timed_out: Iterable[str], warnings: list[str], duration: float,
                         evaluate: bool = False) -> HostSnapshot:
@@ -597,19 +762,31 @@ class ServerMonitor:
                 dataclasses.replace(d, inode_percent=latest.inodes.get(d.mount)) for d in metrics.disks))
 
         system = latest.system
-        if system is not None and latest.ssh_failures is not None and system.journal_access is not False:
-            system = dataclasses.replace(system, ssh_failed_logins_24h=latest.ssh_failures)
+        if system is not None and latest.logins is not None and system.journal_access is not False:
+            system = dataclasses.replace(system, ssh_failed_logins_24h=latest.logins.failed_total)
+        vps = latest.vps
+        if vps is not None and system is not None and system.journal_access is False:
+            vps = dataclasses.replace(vps, oom_kills_24h=None, oom_kills=())
+        smart = latest.smart
+        if smart is not None and smart.state is RuntimeState.NOT_INSTALLED and self.server.smart == "on":
+            warnings.append(smart.message)
+        security = self._security_report(system)
 
         if evaluate:
             for alert in self.policy.evaluate(self.server.name, self._previous, visible):
                 self._emit(alert)
             self._previous = {s.key: s for s in visible}
-            for alert in self.thresholds.evaluate(self.server.name, latest.metrics):
+            for alert in self.thresholds.evaluate(self.server.name, latest.metrics, latest.latency_ms):
+                self._emit(alert)
+            host_alerts = self.host_alerts
+            for alert in (host_alerts.endpoints(latest.endpoints) + host_alerts.smart(smart)
+                          + host_alerts.security(security) + host_alerts.vps(vps)):
                 self._emit(alert)
             if self.history is not None and latest.metrics is not None:
                 failed = sum(1 for s in visible if s.status is ServiceStatus.FAILED)
                 active = sum(1 for s in visible if s.status is ServiceStatus.ACTIVE)
-                self.history.record(self.server.name, time.time(), latest.metrics, failed, active)
+                self.history.record(self.server.name, time.time(), latest.metrics, failed, active,
+                                    latest.latency_ms)
 
         return HostSnapshot(
             server=self.server.name,
@@ -623,20 +800,29 @@ class ServerMonitor:
             events=tuple(latest.events),
             system=system,
             updates=latest.updates,
+            vps=vps,
+            smart=smart,
+            security=security,
+            endpoints=tuple(latest.endpoints),
+            latency_ms=latest.latency_ms,
+            latency_method=latest.latency_method,
             warnings=tuple(dict.fromkeys(w for w in warnings if w)),
             resource_alerts=self.thresholds.active,
             duration=duration,
             detail_at=latest.detail_at,
             inventory_at=latest.inventory_at,
+            security_at=latest.security_at,
+            endpoints_at=latest.endpoints_at,
         )
 
 
 _TASK_LABELS = {
     "units": "unidades systemd", "resources": "recursos por serviço", "metrics": "métricas",
-    "docker": "Docker", "podman": "Podman", "k8s": "Kubernetes", "vm": "VMs", "processes": "processos",
-    "network": "rede", "stats:docker": "stats do Docker", "stats:podman": "stats do Podman",
-    "system": "sistema", "ssh_failures": "falhas de login SSH", "timers": "timers", "cron": "cron",
-    "events": "eventos do journal", "updates": "atualizações",
+    "docker": "Docker", "podman": "Podman", "k8s": "Kubernetes", "vm": "VMs", "lxd": "LXD/Incus",
+    "processes": "processos", "network": "rede", "stats:docker": "stats do Docker", "stats:podman": "stats do Podman",
+    "system": "sistema", "vps": "VPS", "timers": "timers", "cron": "cron", "events": "eventos do journal",
+    "updates": "atualizações", "security": "auditoria de segurança", "ssh_logins": "logins SSH",
+    "sudo_log": "log do sudo", "fail2ban": "fail2ban", "smart": "SMART", "icmp": "ping ICMP",
 }
 
 
@@ -679,6 +865,9 @@ class MonitorManager:
     def set_poll_interval(self, seconds: float) -> None:
         for monitor in self.monitors.values():
             monitor.set_interval(seconds)
+
+    def reconnect(self, server: str) -> None:
+        self.monitors[server].reconnect()
 
     def is_connected(self, server: str) -> bool:
         return self.monitors[server].client.connected
@@ -726,6 +915,11 @@ class MonitorManager:
         label = "Forçar encerramento" if force else "Encerrar"
         return self._submit_action(server, f"PID {pid}", label, f"pid:{pid}",
                                    lambda client: client.kill_process(pid, force))
+
+    def fail2ban_action(self, server: str, jail: str, ip: str, ban: bool) -> Future[ActionResult]:
+        label = "Banir" if ban else "Desbanir"
+        return self._submit_action(server, f"{ip} (jail {jail})", label, f"ip:{ip}",
+                                   lambda client: client.fail2ban_action(jail, ip, ban))
 
     # -- logs ----------------------------------------------------------------
 

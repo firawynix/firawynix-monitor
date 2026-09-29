@@ -11,6 +11,7 @@ Regras de segurança aplicadas a TODOS os comandos:
 
 from __future__ import annotations
 
+import ipaddress
 import re
 import shlex
 from collections.abc import Sequence
@@ -29,6 +30,10 @@ _CONTAINER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}")
 _K8S_NAME_RE = re.compile(r"[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?")
 # libvirt: nomes de domínio sem "/" nem espaços.
 _VM_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+:-]{0,127}")
+# LXD/Incus: letras, dígitos e hífens, começando por letra (até 63).
+_LXD_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9-]{0,62}")
+# fail2ban: nomes de jail ("sshd", "nginx-http-auth", "recidive").
+_JAIL_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}")
 _KUBECTL_RE = re.compile(r"[A-Za-z0-9_./-]+( [A-Za-z0-9_./-]+)?")
 _LIBVIRT_URI_RE = re.compile(r"[a-z+]+://[A-Za-z0-9_./@:-]*")
 
@@ -65,6 +70,22 @@ def validate_kubectl_command(command: str) -> str:
 
 def validate_libvirt_uri(uri: str) -> str:
     return _validate(_LIBVIRT_URI_RE, uri, "URI do libvirt")
+
+
+def validate_lxd_name(name: str) -> str:
+    return _validate(_LXD_NAME_RE, name, "Nome de instância LXD/Incus")
+
+
+def validate_jail(name: str) -> str:
+    return _validate(_JAIL_RE, name, "Jail do fail2ban")
+
+
+def validate_ip(value: str) -> str:
+    """Endereço IPv4/IPv6 canônico (rejeita nomes, máscaras e opções)."""
+    try:
+        return str(ipaddress.ip_address(str(value).strip()))
+    except ValueError:
+        raise ValueError(f"Endereço IP inválido: {value!r}") from None
 
 
 def validate_pid(pid: int) -> int:
@@ -242,6 +263,39 @@ def build_vm_info_command(uri: str, name: str, use_sudo: bool) -> str:
 
 
 # ---------------------------------------------------------------------------
+# LXD / Incus
+# ---------------------------------------------------------------------------
+
+#: Clientes aceitos: Incus, LXD (snap ou pacote) — detectados no servidor.
+LXD_CLIS = ("incus", "lxc", "/snap/bin/lxc")
+
+
+def _lxd_cli(cli: str) -> str:
+    if cli not in LXD_CLIS:
+        raise ValueError(f"Cliente LXD/Incus inválido: {cli!r}")
+    return cli
+
+
+def build_lxd_list_command(use_sudo: bool) -> str:
+    """Primeira linha ``CLI=<cliente>``; depois o JSON de ``list`` (inclui o estado)."""
+    return (
+        "if command -v incus >/dev/null 2>&1; then c=incus; "
+        "elif command -v lxc >/dev/null 2>&1; then c=lxc; "
+        "elif [ -x /snap/bin/lxc ]; then c=/snap/bin/lxc; "
+        "else echo 'lxd: command not found' >&2; exit 127; fi; "
+        f'echo "CLI=$c"; {sudo(use_sudo)}"$c" list --format json'
+    )
+
+
+def build_lxd_action_command(cli: str, name: str, action: ServiceAction, use_sudo: bool) -> str:
+    return f"{sudo(use_sudo)}{_lxd_cli(cli)} {action.value} {shlex.quote(validate_lxd_name(name))}"
+
+
+def build_lxd_info_command(cli: str, name: str, use_sudo: bool) -> str:
+    return f"{sudo(use_sudo)}{_lxd_cli(cli)} info --show-log {shlex.quote(validate_lxd_name(name))} 2>&1"
+
+
+# ---------------------------------------------------------------------------
 # Host: métricas, processos, rede, inventário
 # ---------------------------------------------------------------------------
 
@@ -310,9 +364,179 @@ SYSTEM_INFO_CMD = sections(
     with_timeout("df -iP", 2) + " 2>/dev/null",
 )
 
-SSH_FAILURES_CMD = with_timeout(
-    "journalctl _COMM=sshd --since=-24h -o cat --no-pager", 3
-) + " 2>/dev/null | grep -ciE 'failed password|invalid user|authentication failure'"
+# Logins SSH das últimas 24 h, agregados NO SERVIDOR (VPS expostos recebem
+# dezenas de milhares de tentativas por dia): uma linha "F" por IP de origem,
+# o total e os últimos 100 logins aceitos. Cada conexão (ip:porta) conta uma
+# vez, mesmo que gere várias linhas ("Invalid user" + "Failed password").
+# OpenSSH >= 9.8 registra a autenticação como "sshd-session".
+_SSH_LOGINS_AWK = r"""
+{
+  if ($0 ~ /Accepted [a-z-]+(\/[a-z]+)? for /) { na++; acc[na % 100] = $0; next }
+  user = ""; ip = ""; port = ""
+  if ($0 ~ /Invalid user /) {
+    for (i = 1; i < NF; i++) if ($i == "user") { user = $(i + 1); break }
+  } else if ($0 ~ /Failed (password|keyboard-interactive\/pam) for /) {
+    for (i = 1; i < NF; i++) if ($i == "for") { user = $(i + 1); if (user == "invalid") user = $(i + 3); break }
+  } else if ($0 ~ /(Connection closed by|Disconnected from) authenticating user /) {
+    for (i = 1; i < NF; i++) if ($i == "user") { user = $(i + 1); ip = $(i + 2); break }
+  } else next
+  for (i = 1; i < NF; i++) { if ($i == "from" && ip == "") ip = $(i + 1); if ($i == "port") port = $(i + 1) }
+  if (user == "from") user = ""
+  if (ip == "") next
+  key = ip ":" port
+  if (key in seen) next
+  seen[key] = 1; total++; count[ip]++; last[ip] = $1; lastuser[ip] = user
+}
+END {
+  print "TOTAL", total + 0
+  for (ip in count) print "F", count[ip], last[ip], ip, lastuser[ip]
+  start = na - 99; if (start < 1) start = 1
+  for (i = start; i <= na; i++) print acc[i % 100]
+}
+"""
+SSH_LOGINS_CMD = (
+    with_timeout("journalctl _COMM=sshd _COMM=sshd-session --since=-24h -o short-unix --no-pager", 3)
+    + " 2>/dev/null | awk " + shlex.quote(_SSH_LOGINS_AWK.strip())
+)
+
+# Comandos executados com sudo nas últimas 24 h. As chamadas "sudo -n" do próprio
+# monitor (usuário SSH, sem terminal) são descartadas para não poluir a lista.
+_SUDO_AWK = r"""
+{
+  if ($0 !~ /COMMAND=|incorrect password attempt|NOT in sudoers/) next
+  if ($4 == me && $0 !~ /TTY=(pts|tty|\/dev)/) next
+  total++; n++; ev[n % 100] = $0
+}
+END {
+  print "TOTAL", total + 0
+  start = n - 99; if (start < 1) start = 1
+  for (i = start; i <= n; i++) print ev[i % 100]
+}
+"""
+
+
+def build_sudo_log_command(ssh_user: str) -> str:
+    return (with_timeout("journalctl _COMM=sudo --since=-24h -o short-unix --no-pager", 3)
+            + f" 2>/dev/null | awk -v me={shlex.quote(ssh_user)} " + shlex.quote(_SUDO_AWK.strip()))
+
+
+# ---------------------------------------------------------------------------
+# VPS: provedor, horário, DNS, OOM killer e franquia de tráfego (vnStat)
+# ---------------------------------------------------------------------------
+
+_OOM_AWK = r"""
+tolower($0) ~ /out of memory: kill/ { n++; l[n % 20] = $0 }
+END { print "OOM_TOTAL", n + 0; s = n - 19; if (s < 1) s = 1; for (i = s; i <= n; i++) print l[i % 20] }
+"""
+
+VPS_CMD = sections(
+    "for f in sys_vendor product_name bios_vendor; do printf '%s=' \"$f\"; "
+    "cat \"/sys/class/dmi/id/$f\" 2>/dev/null || echo; done; "
+    "printf 'hypervisor='; cat /sys/hypervisor/type 2>/dev/null || echo; "
+    "echo \"swappiness=$(cat /proc/sys/vm/swappiness 2>/dev/null)\"; "
+    "grep -E '^nameserver' /etc/resolv.conf 2>/dev/null; ip route show default 2>/dev/null | head -n 2; true",
+    "timedatectl show 2>/dev/null || timedatectl status 2>/dev/null; "
+    "if command -v chronyc >/dev/null 2>&1; then chronyc -n tracking 2>/dev/null "
+    "| grep -E '^(System time|Leap status)'; fi; true",
+    with_timeout("journalctl -k --since=-24h -o short-unix --no-pager", 2)
+    + " 2>/dev/null | awk " + shlex.quote(_OOM_AWK.strip()),
+    # "m 1"/"d 1" (vnStat >= 2.6) limitam a saída; versões antigas caem no JSON completo.
+    "if command -v vnstat >/dev/null 2>&1; then vnstat --json m 1 2>/dev/null || vnstat --json 2>/dev/null; "
+    "echo; echo '#DAY'; vnstat --json d 1 2>/dev/null; else echo NOVNSTAT; fi; true",
+)
+
+
+# ---------------------------------------------------------------------------
+# SMART (saúde dos discos físicos)
+# ---------------------------------------------------------------------------
+
+def build_smart_command(use_sudo: bool) -> str:
+    """``smartctl --scan`` + ``smartctl -j`` (JSON, smartmontools >= 7) por disco.
+
+    "scsi" vira "auto": discos SATA atrás do libata aparecem como scsi no scan,
+    mas só mostram os atributos ATA com a detecção automática (SAT).
+    """
+    smartctl = with_timeout(sudo(use_sudo) + 'smartctl -j -H -A -i -d "$type" "$dev"', 3)
+    return (
+        "command -v smartctl >/dev/null 2>&1 || [ -x /usr/sbin/smartctl ] || "
+        "{ echo 'smartctl: command not found' >&2; exit 127; }; PATH=\"$PATH:/usr/sbin:/sbin\"; "
+        "smartctl --scan 2>/dev/null | head -n 6 | while read -r dev _ type _; do "
+        "[ \"$type\" = scsi ] && type=auto; echo \"## $dev\"; "
+        f"{smartctl} 2>&1; done"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Segurança (auditoria sem agente)
+# ---------------------------------------------------------------------------
+
+_SERVICES_TO_CHECK = ("ufw", "firewalld", "nftables", "netfilter-persistent", "iptables", "fail2ban",
+                      "crowdsec", "auditd", "unattended-upgrades", "dnf-automatic.timer",
+                      "dnf-automatic-install.timer", "ssh", "sshd")
+_BINARIES_TO_CHECK = ("ufw", "fail2ban-client", "cscli", "nft", "iptables", "firewall-cmd", "smartctl", "vnstat")
+_SYSCTLS = ("kernel/randomize_va_space", "net/ipv4/tcp_syncookies", "net/ipv4/conf/all/accept_redirects",
+            "net/ipv6/conf/all/accept_redirects", "net/ipv4/conf/all/send_redirects",
+            "net/ipv4/conf/all/accept_source_route", "net/ipv4/conf/all/rp_filter", "net/ipv4/ip_forward",
+            "kernel/kptr_restrict", "kernel/dmesg_restrict", "fs/protected_hardlinks", "fs/protected_symlinks")
+
+
+def build_security_command(use_sudo: bool, privileged: bool | None = None) -> str:
+    """Um round-trip, 4 seções: sshd, chave=valor, ``who`` e ``authorized_keys``.
+
+    Sem sudo, tudo é lido de arquivos públicos (sshd_config, ufw.conf, /proc/sys,
+    /etc/passwd...). Com ``security_sudo`` também usa ``sshd -T`` (configuração
+    efetiva), ``ufw status``, ``iptables -S INPUT`` e ``nft list ruleset``.
+    """
+    s = sudo(use_sudo)
+    # Conectado como root: as leituras privilegiadas dispensam o sudo.
+    privileged = use_sudo if privileged is None else privileged
+    files = ("echo '#FILES'; for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do "
+             "[ -r \"$f\" ] && { echo \"#FILE $f\"; cat \"$f\"; }; done; true")
+    sshd = f"if {s}sshd -T 2>/dev/null; then :; else {files}; fi" if privileged else files
+    kv = [
+        f"for s in {' '.join(_SERVICES_TO_CHECK)}; do "
+        "printf 'svc=%s=%s\\n' \"$s\" \"$(systemctl is-active \"$s\" 2>/dev/null)\"; done",
+        f"for c in {' '.join(_BINARIES_TO_CHECK)}; do for d in /usr/sbin /usr/bin /sbin /bin /usr/local/sbin "
+        "/usr/local/bin; do [ -x \"$d/$c\" ] && { echo \"bin=$c\"; break; }; done; done",
+        "echo \"ufw_enabled=$(sed -n 's/^ENABLED=//p' /etc/ufw/ufw.conf 2>/dev/null | head -n 1)\"",
+        "awk -F: '$3 == 0 { print \"uid0=\" $1 } $7 !~ /(nologin|false|sync|shutdown|halt)$/ && $7 != \"\" "
+        "{ print \"login=\" $1 }' /etc/passwd 2>/dev/null",
+        "for g in sudo wheel admin; do getent group \"$g\" | cut -d: -f4 | tr ',' '\\n' "
+        "| sed -n 's/^\\(..*\\)$/sudoer=\\1/p'; done",
+        f"for k in {' '.join(_SYSCTLS)}; do printf 'sysctl=%s=%s\\n' \"$k\" \"$(cat /proc/sys/$k 2>/dev/null)\"; "
+        "done",
+        "echo \"apparmor=$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)\"; "
+        "echo \"selinux=$(getenforce 2>/dev/null)\"",
+        "command -v apt-config >/dev/null 2>&1 && echo \"auto_apt=$(apt-config dump "
+        "APT::Periodic::Unattended-Upgrade 2>/dev/null | sed -n 's/.*\"\\(.*\\)\".*/\\1/p' | tail -n 1)\"",
+        "echo \"tmp_mode=$(stat -c %a /tmp 2>/dev/null)\"; echo \"ssh_client=${SSH_CLIENT%% *}\"",
+    ]
+    if privileged:
+        kv += [
+            f"out=$({s}iptables -S INPUT 2>/dev/null) && {{ "
+            "echo \"ipt_policy=$(echo \"$out\" | sed -n 's/^-P INPUT //p')\"; "
+            "echo \"ipt_rules=$(echo \"$out\" | grep -c '^-A')\"; }",
+            f"out=$({s}nft list ruleset 2>/dev/null) && "
+            "echo \"nft_rules=$(echo \"$out\" | grep -cE '(accept|drop|reject)$')\"",
+            f"echo '#UFW'; {s}ufw status verbose 2>/dev/null",
+        ]
+    return sections(sshd, "; ".join(kv) + "; true", "who 2>/dev/null; true",
+                    "cat ~/.ssh/authorized_keys ~/.ssh/authorized_keys2 2>/dev/null; true")
+
+
+def build_fail2ban_status_command(use_sudo: bool) -> str:
+    s = sudo(use_sudo)
+    return (
+        f"out=$({s}fail2ban-client status 2>&1) || {{ echo \"$out\" >&2; exit 1; }}; echo \"$out\"; n=0; "
+        "for j in $(echo \"$out\" | sed -n 's/.*Jail list:[[:space:]]*//p' | tr ',' ' '); do "
+        "n=$((n + 1)); [ \"$n\" -gt 10 ] && break; "
+        f'echo "## $j"; {s}fail2ban-client status "$j" 2>&1; done'
+    )
+
+
+def build_fail2ban_ban_command(jail: str, ip: str, ban: bool, use_sudo: bool) -> str:
+    verb = "banip" if ban else "unbanip"
+    return f"{sudo(use_sudo)}fail2ban-client set {shlex.quote(validate_jail(jail))} {verb} {validate_ip(ip)}"
 
 
 def build_events_command(priority: str, limit: int, since_hours: int) -> str:

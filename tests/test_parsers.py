@@ -420,7 +420,7 @@ def test_parse_metrics_tolerates_garbage():
 
 def test_cpu_samples_and_percent():
     samples = parse_cpu_samples("cpu  100 0 100 800 0 0 0 0 0 0\ncpu  150 0 150 900 0 0 0 0 0 0\n")
-    assert samples == [(800, 1000), (900, 1200)]
+    assert samples == [(800, 1000, 0, 0), (900, 1200, 0, 0)]
     assert cpu_percent_between(samples[0], samples[1]) == pytest.approx(50.0)
     assert cpu_percent_between((10, 10), (10, 10)) is None
 

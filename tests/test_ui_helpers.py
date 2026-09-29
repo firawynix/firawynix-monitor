@@ -9,6 +9,8 @@ from ui.widgets import (  # noqa: E402
     Row,
     _gap_threshold,
     _nice_ceiling,
+    _nice_scale,
+    _ticks,
     _sort_value,
     fmt_bytes,
     fmt_duration,
@@ -52,3 +54,16 @@ def test_sort_value_puts_none_last_and_ignores_case():
     ordered = sorted(rows, key=lambda r: _sort_value(r, 0))
     assert [r.key for r in ordered] == ["c", "a", "b"]
     assert _sort_value(Row("x", ("v",), status=ServiceStatus.ACTIVE), 1) == (0, "v")
+
+
+@pytest.mark.parametrize(("value", "base", "expected"), [
+    (23.0, 10, (25.0, 5.0)),         # latência: 0, 5, 10, 15, 20, 25 ms
+    (2.0, 10, (2.0, 0.5)),
+    (97.0, 10, (100.0, 25.0)),
+    (9.5 * 1024 ** 2, 1024, (10 * 1024 ** 2, 2.5 * 1024 ** 2)),  # 2,5 MB/s por marca
+    (0, 10, (1.0, 0.25)),
+])
+def test_nice_scale(value, base, expected):
+    y_max, step = _nice_scale(value, base)
+    assert (y_max, step) == pytest.approx(expected)
+    assert y_max >= value and _ticks(y_max, step)[-1] == pytest.approx(y_max)

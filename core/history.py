@@ -19,7 +19,7 @@ from core.models import HostMetrics
 log = logging.getLogger(__name__)
 
 FIELDS = ("cpu", "mem", "swap", "load1", "disk", "net_rx", "net_tx", "disk_read", "disk_write",
-          "failed", "active")
+          "failed", "active", "steal", "iowait", "latency")
 _PRUNE_EVERY = 600.0
 
 
@@ -66,21 +66,29 @@ class HistoryStore:
         columns = ", ".join(f"{name} REAL" for name in FIELDS)
         conn.execute(f"CREATE TABLE IF NOT EXISTS samples (server TEXT NOT NULL, ts REAL NOT NULL, {columns}, "
                      "PRIMARY KEY (server, ts)) WITHOUT ROWID")
+        # Migração: bancos criados por versões anteriores ganham as colunas novas.
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(samples)")}
+        for name in FIELDS:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE samples ADD COLUMN {name} REAL")
         return conn
 
     def record(self, server: str, timestamp: float, metrics: HostMetrics | None,
-               failed: int | None = None, active: int | None = None) -> None:
+               failed: int | None = None, active: int | None = None, latency: float | None = None) -> None:
         if metrics is None:
             return
         root = metrics.root_disk
         load = metrics.load_avg[0] if metrics.load_avg else None
-        row = (server, timestamp, metrics.cpu_percent, metrics.mem_percent, metrics.swap_percent, load,
-               root.use_percent if root else None, metrics.net_rx_bps, metrics.net_tx_bps,
-               metrics.disk_read_bps, metrics.disk_write_bps, failed, active)
-        placeholders = ", ".join("?" * len(row))
+        values = (metrics.cpu_percent, metrics.mem_percent, metrics.swap_percent, load,
+                  root.use_percent if root else None, metrics.net_rx_bps, metrics.net_tx_bps,
+                  metrics.disk_read_bps, metrics.disk_write_bps, failed, active, metrics.cpu_steal,
+                  metrics.cpu_iowait, latency)
+        columns = ", ".join(("server", "ts", *FIELDS))
+        placeholders = ", ".join("?" * (len(FIELDS) + 2))
         try:
             with self._lock:
-                self._conn.execute(f"INSERT OR REPLACE INTO samples VALUES ({placeholders})", row)
+                self._conn.execute(f"INSERT OR REPLACE INTO samples ({columns}) VALUES ({placeholders})",
+                                   (server, timestamp, *values))
                 if timestamp - self._last_prune > _PRUNE_EVERY:
                     self._last_prune = timestamp
                     self._conn.execute("DELETE FROM samples WHERE ts < ?", (timestamp - self.retention_seconds,))

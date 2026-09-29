@@ -15,20 +15,25 @@ from core.models import (
     ConnectionEvent,
     ConnectionState,
     DiskUsage,
+    HostAlertEvent,
     HostMetrics,
     NetworkInfo,
     ProcessInfo,
     RuntimeResult,
     RuntimeState,
+    SecurityRaw,
     ServiceAction,
     ServiceAlertEvent,
     ServiceInfo,
     ServiceKind,
     ServiceStatus,
+    SmartReport,
     SnapshotEvent,
+    SshLoginReport,
     Stack,
     SystemInfo,
     ThresholdAlertEvent,
+    VpsInfo,
 )
 from core.monitor import AlertPolicy, ExponentialBackoff, MonitorManager, ThresholdPolicy, matches_patterns
 from core.ssh_client import SSHCommandTimeout, SSHConnectionError
@@ -238,8 +243,40 @@ class FakeClient:
         self._count("system")
         return SystemInfo(hostname="fake", journal_access=True), {"/": 42.0}
 
-    def ssh_failed_logins(self):
-        return 5
+    def ssh_logins(self):
+        self._count("ssh_logins")
+        return SshLoginReport(failed_total=5)
+
+    def list_lxd(self):
+        self._count("lxd")
+        return RuntimeResult(ServiceKind.LXD, RuntimeState.NOT_INSTALLED)
+
+    def vps_info(self):
+        self._count("vps")
+        return VpsInfo(provider="Hetzner Cloud", ntp_synchronized=True)
+
+    def smart(self):
+        self._count("smart")
+        return SmartReport(RuntimeState.NOT_INSTALLED, (), "smartctl não instalado")
+
+    def security_raw(self):
+        self._count("security")
+        return SecurityRaw(sshd={"permitrootlogin": "yes", "passwordauthentication": "no"})
+
+    def fail2ban_status(self):
+        self._count("fail2ban")
+        return (), ""
+
+    def sudo_log(self):
+        self._count("sudo")
+        return ()
+
+    def take_rtt(self):
+        return 12.5
+
+    def fail2ban_action(self, jail, ip, ban):
+        self.actions.append((jail, ip, ban))
+        return ActionResult(ActionOutcome.OK, "ok")
 
     def updates(self):
         self._count("updates")
@@ -432,3 +469,80 @@ def test_run_action_when_disconnected_returns_error():
     with pytest.raises(SSHConnectionError):
         manager.fetch_logs("srv", client.units[0], 10).result(timeout=5)
     manager.stop()
+
+
+# ---------------------------------------------------------------------------
+# v3: segurança, VPS, latência, endpoints e fail2ban
+# ---------------------------------------------------------------------------
+
+def test_monitor_security_vps_latency_and_host_alerts():
+    client = FakeClient()
+    manager = _manager(client)
+    manager.start()
+    try:
+        events = _collect(manager, lambda ev: _count(ev, SnapshotEvent) >= 3)
+    finally:
+        manager.stop()
+    snapshot = _snapshots(events)[-1]
+    assert snapshot.vps.provider == "Hetzner Cloud"
+    assert snapshot.latency_ms == 12.5 and snapshot.latency_method == "SSH"
+    assert snapshot.security is not None and snapshot.security.check("ssh_root").level.value == "fail"
+    assert snapshot.smart.state is RuntimeState.NOT_INSTALLED and snapshot.warnings == ()
+    assert snapshot.system.ssh_failed_logins_24h == 5
+    assert client.calls["security"] == 1 and client.calls["ssh_logins"] == 1 and client.calls["smart"] == 1
+    assert "fail2ban" not in client.calls  # sem security_sudo o fail2ban-client não é consultado
+    alerts = [e for e in events if isinstance(e, HostAlertEvent)]
+    assert [(a.category, a.key) for a in alerts] == [("security", "srv:security:ssh_root")]
+
+
+def test_monitor_skips_security_when_disabled_and_queries_fail2ban_with_sudo():
+    client = FakeClient()
+    manager = _manager(client, security=False, smart="off")
+    manager.start()
+    try:
+        _collect(manager, lambda ev: _count(ev, SnapshotEvent) >= 2)
+    finally:
+        manager.stop()
+    assert not {"security", "ssh_logins", "smart", "fail2ban"} & set(client.calls)
+
+    client = FakeClient()
+    manager = _manager(client, security_sudo=True, security_actions=True)
+    manager.start()
+    try:
+        _collect(manager, lambda ev: _count(ev, SnapshotEvent) >= 1)
+        result = manager.fail2ban_action("srv", "sshd", "203.0.113.9", True).result(timeout=5)
+    finally:
+        manager.stop()
+    assert client.calls["fail2ban"] >= 1  # a ação força nova coleta completa
+    assert result.outcome is ActionOutcome.OK and ("sshd", "203.0.113.9", True) in client.actions
+
+
+def test_monitor_checks_endpoints_in_background():
+    import http.server
+    import threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(503)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    client = FakeClient()
+    manager = _manager(client, endpoints=(f"http://127.0.0.1:{server.server_address[1]}/",))
+    manager.start()
+    try:
+        events = _collect(manager, lambda ev: any(snap.endpoints for snap in _snapshots(ev)))
+    finally:
+        manager.stop()
+        server.shutdown()
+    snapshot = next(snap for snap in _snapshots(events) if snap.endpoints)
+    (result,) = snapshot.endpoints
+    assert result.status is ServiceStatus.FAILED and result.http_status == 503
+    assert snapshot.failing_endpoints() == [result]
+    alerts = [e for e in events if isinstance(e, HostAlertEvent) and e.category == "endpoint"]
+    assert [a.level for a in alerts] == ["critical"]  # emitido junto com o snapshot

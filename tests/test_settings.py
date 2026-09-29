@@ -171,3 +171,58 @@ def test_invalid_nested_settings():
                       **_minimal()})
     message = str(err.value)
     assert "cpu_percent" in message and "bogus" in message and "priority" in message
+
+
+def test_v3_server_options_and_defaults():
+    config = parse_config(_minimal(
+        lxd="on", lxd_sudo=True, smart=False, security_sudo=True, security_actions=True,
+        endpoints=["https://loja.exemplo.com/health", "tcp://db.exemplo.com:5432"],
+        bandwidth_quota_gb=2000, bandwidth_count="total", password_credential=True,
+        key_passphrase_credential="Minha/Chave"))
+    server = config.servers[0]
+    assert (server.lxd, server.lxd_sudo, server.smart) == ("on", True, "off")
+    assert server.security and server.security_sudo and server.security_actions
+    assert server.endpoints == ("https://loja.exemplo.com/health", "tcp://db.exemplo.com:5432")
+    assert (server.bandwidth_quota_gb, server.bandwidth_count) == (2000.0, "total")
+    assert server.password_credential == "FirawynixMonitor/web"
+    assert server.key_passphrase_credential == "Minha/Chave"
+    assert server.uses_password
+    defaults = parse_config(_minimal()).servers[0]
+    assert (defaults.smart, defaults.security, defaults.security_sudo, defaults.endpoints) == ("auto", True, False, ())
+    assert not defaults.uses_password
+
+
+def test_v3_settings_sections():
+    raw = _minimal()
+    raw["settings"] = {
+        "security_interval_seconds": 600, "endpoint_interval_seconds": 30, "cert_warning_days": 21,
+        "latency_probe": "ssh", "thresholds": {"steal_percent": 15, "latency_ms": 250},
+        "notifications": {"notify_on_ssh_login": "all", "security_alerts": False},
+        "windows": {"event_log": False, "prevent_sleep": True},
+    }
+    settings = parse_config(raw).settings
+    assert (settings.security_interval_seconds, settings.endpoint_interval_seconds) == (600, 30)
+    assert (settings.cert_warning_days, settings.latency_probe) == (21, "ssh")
+    assert (settings.thresholds.steal_percent, settings.thresholds.latency_ms) == (15, 250)
+    assert settings.notifications.notify_on_ssh_login == "all" and not settings.notifications.security_alerts
+    assert not settings.windows.event_log and settings.windows.prevent_sleep and settings.windows.flash_taskbar
+
+
+@pytest.mark.parametrize(("overrides", "message"), [
+    ({"endpoints": ["ftp://x"]}, "endpoints[0]"),
+    ({"endpoints": ["https://u:p@x"]}, "credenciais"),
+    ({"bandwidth_count": "rx"}, "bandwidth_count"),
+    ({"bandwidth_quota_gb": True}, "bandwidth_quota_gb"),
+    ({"password_credential": 5}, "password_credential"),
+    ({"lxd": "sometimes"}, "lxd"),
+])
+def test_v3_invalid_options(overrides, message):
+    with pytest.raises(ConfigError) as err:
+        parse_config(_minimal(**overrides))
+    assert message in str(err.value)
+
+
+def test_plaintext_password_hint_mentions_credential_manager():
+    with pytest.raises(ConfigError) as err:
+        parse_config(_minimal(password="x"))
+    assert "password_credential" in str(err.value)

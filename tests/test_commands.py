@@ -101,10 +101,42 @@ def test_metrics_command_samples_cpu_twice_only_on_first_poll():
 
 @pytest.mark.parametrize("command", [
     cmd.SYSTEM_INFO_CMD, cmd.CRON_CMD, cmd.UPDATES_CMD, cmd.CGROUP_SERVICES_CMD, cmd.TIMERS_CMD,
-    cmd.SSH_FAILURES_CMD, cmd.build_metrics_command(True), cmd.build_processes_command(True),
+    cmd.SSH_LOGINS_CMD, cmd.build_sudo_log_command("monitor"), cmd.VPS_CMD, cmd.build_smart_command(True),
+    cmd.build_security_command(False), cmd.build_security_command(True), cmd.build_fail2ban_status_command(True),
+    cmd.build_lxd_list_command(True), cmd.build_metrics_command(True), cmd.build_processes_command(True),
     cmd.build_ports_command(True), cmd.build_pods_command("kubectl", False), cmd.build_events_command("err", 100, 24),
     cmd.build_stack_logs_command("podman", ["a", "b"], 10, True), cmd.build_vm_info_command("qemu:///system", "x", 0),
 ])
 def test_composite_commands_are_valid_posix_shell(command):
     result = subprocess.run(["sh", "-n", "-c", cmd.wrap_remote_command(command)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+def test_security_command_privileged_parts_follow_sudo_or_root():
+    plain = cmd.build_security_command(False)
+    assert "sshd -T" not in plain and "iptables -S" not in plain and "sudo -n" not in plain
+    as_root = cmd.build_security_command(False, privileged=True)
+    assert "sshd -T" in as_root and "iptables -S INPUT" in as_root and "sudo -n" not in as_root
+    with_sudo = cmd.build_security_command(True)
+    assert "sudo -n sshd -T" in with_sudo and "sudo -n ufw status verbose" in with_sudo
+
+
+@pytest.mark.parametrize(("builder", "bad"), [
+    (lambda v: cmd.build_fail2ban_ban_command(v, "1.2.3.4", True, True), "-x"),
+    (lambda v: cmd.build_fail2ban_ban_command(v, "1.2.3.4", True, True), "sshd; reboot"),
+    (lambda v: cmd.build_fail2ban_ban_command("sshd", v, False, True), "1.2.3.4/24"),
+    (lambda v: cmd.build_fail2ban_ban_command("sshd", v, False, True), "$(id)"),
+    (lambda v: cmd.build_lxd_action_command("incus", v, cmd.ServiceAction.STOP, False), "-force"),
+    (lambda v: cmd.build_lxd_action_command("incus", v, cmd.ServiceAction.STOP, False), "web;rm"),
+    (lambda v: cmd.build_lxd_action_command(v, "web", cmd.ServiceAction.STOP, False), "sh -c"),
+])
+def test_v3_builders_reject_injection(builder, bad):
+    with pytest.raises(ValueError):
+        builder(bad)
+
+
+def test_v3_builders_quote_and_normalize():
+    assert cmd.build_fail2ban_ban_command("sshd", " 2001:DB8::1 ", True, True) == \
+        "sudo -n fail2ban-client set sshd banip 2001:db8::1"
+    assert cmd.build_lxd_action_command("/snap/bin/lxc", "web-01", cmd.ServiceAction.RESTART, False) == \
+        "/snap/bin/lxc restart web-01"

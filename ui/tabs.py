@@ -16,6 +16,7 @@ import customtkinter as ctk
 from tkinter import filedialog
 
 from core.models import (
+    CheckLevel,
     ConnectionEvent,
     ConnectionState,
     HealthLevel,
@@ -28,6 +29,7 @@ from core.models import (
     Stack,
 )
 from core.parsers import classify_systemd, format_timestamp
+from ui import theme
 from ui.widgets import (
     CARD_BG,
     GRAY,
@@ -99,8 +101,7 @@ def _button(master, text: str, command: Callable[[], None], kind: str = "default
     colors = {
         "start": {"fg_color": ("#2da44e", "#238636"), "hover_color": ("#2c974b", "#2ea043")},
         "stop": {"fg_color": ("#cf222e", "#b62324"), "hover_color": ("#a40e26", "#d9363e")},
-        "neutral": {"fg_color": ("gray70", "gray30"), "hover_color": ("gray60", "gray35"),
-                    "text_color": ("gray10", "gray95")},
+        "neutral": {"fg_color": theme.NEUTRAL, "hover_color": theme.NEUTRAL_HOVER, "text_color": theme.TEXT},
         "default": {},
     }[kind]
     return ctk.CTkButton(master, text=text, width=width, command=command, **colors)
@@ -111,7 +112,8 @@ def _set_state(button: ctk.CTkButton, enabled: bool) -> None:
 
 
 def _section_label(master, text: str) -> ctk.CTkLabel:
-    return ctk.CTkLabel(master, text=text, anchor="w", font=ctk.CTkFont(size=13, weight="bold"))
+    return ctk.CTkLabel(master, text=text, anchor="w", text_color=theme.ACCENT_TEXT,
+                        font=ctk.CTkFont(size=13, weight="bold"))
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +145,7 @@ TYPE_FILTERS: dict[str, Callable[[ServiceInfo], bool]] = {
     "Contêineres Podman": lambda s: s.kind is ServiceKind.PODMAN,
     "Pods Kubernetes": lambda s: s.kind is ServiceKind.KUBERNETES,
     "Máquinas virtuais": lambda s: s.kind is ServiceKind.LIBVIRT,
+    "Instâncias LXD/Incus": lambda s: s.kind is ServiceKind.LXD,
 }
 
 
@@ -803,8 +806,9 @@ class SystemTab(Tab):
         super().__init__(master, app)
         self.grid_columnconfigure(0, weight=3)
         self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(2, weight=1)
-        self.info = InfoGrid(self, columns=2)
+        self.grid_rowconfigure(2, weight=3, minsize=120)
+        self.grid_rowconfigure(4, weight=2, minsize=110)
+        self.info = InfoGrid(self, columns=3, wraplength=270)
         self.info.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8), ipady=6)
         _section_label(self, "Discos").grid(row=1, column=0, sticky="w", pady=(0, 4))
         _section_label(self, "E/S de disco").grid(row=1, column=1, sticky="w", padx=(10, 0), pady=(0, 4))
@@ -824,6 +828,20 @@ class SystemTab(Tab):
             export_name="disco-es",
         )
         self.io.grid(row=2, column=1, sticky="nsew", padx=(10, 0))
+        smart_header = ctk.CTkFrame(self, fg_color="transparent")
+        smart_header.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(10, 4))
+        smart_header.grid_columnconfigure(1, weight=1)
+        _section_label(smart_header, "Saúde dos discos (SMART)").grid(row=0, column=0, sticky="w")
+        self.smart_info = ctk.CTkLabel(smart_header, text="", text_color=GRAY, anchor="e")
+        self.smart_info.grid(row=0, column=1, sticky="e")
+        self.smart = DataTable(
+            self,
+            [Column("dev", "Disco", 110), Column("model", "Modelo", 220), Column("size", "Capacidade", 115, anchor="e"),
+             Column("temp", "Temperatura", 120, anchor="e"), Column("hours", "Horas ligado", 125, anchor="e"),
+             Column("wear", "Desgaste", 95, anchor="e"), Column("problems", "Problemas / mensagem", 300, True)],
+            tree_column=Column("status", "Saúde", 115), sort_column="status", export_name="smart",
+        )
+        self.smart.grid(row=4, column=0, columnspan=2, sticky="nsew")
 
     def render(self, server: str, snapshot: HostSnapshot | None, connected: bool) -> None:
         system = snapshot.system if snapshot else None
@@ -880,6 +898,34 @@ class SystemTab(Tab):
         io = metrics.disk_io if metrics else ()
         self.io.set_rows([Row(key=d.device, values=(d.device, fmt_rate(d.read_bps), fmt_rate(d.write_bps)),
                               sort=(d.device, d.read_bps, d.write_bps)) for d in io], "Sem dados.")
+        self._render_smart(server, snapshot)
+
+    def _render_smart(self, server: str, snapshot: HostSnapshot | None) -> None:
+        report = snapshot.smart if snapshot else None
+        labels = {ServiceStatus.ACTIVE: "Saudável", ServiceStatus.DEGRADED: "Atenção", ServiceStatus.FAILED: "Falhando",
+                  ServiceStatus.UNKNOWN: "Sem dados"}
+        rows = []
+        for disk in report.disks if report else ():
+            status = disk.status
+            rows.append(Row(
+                key=disk.device, text=labels.get(status, status.label), status=status,
+                values=(disk.device, disk.model or "—", fmt_bytes(disk.capacity_bytes),
+                        "—" if disk.temperature is None else f"{fmt_num(disk.temperature, 0)} °C",
+                        "—" if disk.power_on_hours is None else fmt_num(disk.power_on_hours, 0),
+                        "—" if disk.percentage_used is None else f"{disk.percentage_used}%",
+                        ", ".join(disk.problems) or disk.message or "nenhum"),
+                sort=((status.severity, disk.device), disk.device, disk.model, disk.capacity_bytes, disk.temperature,
+                      disk.power_on_hours, disk.percentage_used, disk.message),
+            ))
+        if self.app.server_config(server).smart == "off":
+            empty, info = "SMART desativado (\"smart\": \"off\").", ""
+        elif report is None:
+            empty, info = "Aguardando a coleta de segurança/SMART…", ""
+        else:
+            empty = report.message or "Nenhum disco."
+            info = "" if report.state is RuntimeState.OK else report.message
+        self.smart.set_rows(rows, empty)
+        self.smart_info.configure(text=info, text_color=YELLOW if info else GRAY)
 
     @staticmethod
     def _updates_text(updates) -> str:
@@ -907,6 +953,7 @@ class SystemTab(Tab):
     def reset(self) -> None:
         self.disks.clear()
         self.io.clear()
+        self.smart.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -926,7 +973,7 @@ class HistoryTab(Tab):
         self._last_key: tuple | None = None
         self._series = None
         self.grid_columnconfigure((0, 1), weight=1, uniform="chart")
-        self.grid_rowconfigure((1, 2), weight=1, uniform="chart_row")
+        self.grid_rowconfigure((1, 2, 3), weight=1, uniform="chart_row")
         toolbar = ctk.CTkFrame(self, fg_color="transparent")
         toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         toolbar.grid_columnconfigure(1, weight=1)
@@ -938,14 +985,17 @@ class HistoryTab(Tab):
         _button(toolbar, "Exportar CSV…", self._export, "neutral", 130).grid(row=0, column=2)
 
         percent = lambda v: f"{fmt_num(v, 0)}%"  # noqa: E731
-        self.usage = LineChart(self, "Uso de recursos (%)", percent, fixed_max=100)
-        self.load = LineChart(self, "Load average (1 min)", lambda v: fmt_num(v, 2))
-        self.net = LineChart(self, "Rede (por segundo)", fmt_rate)
-        self.disk = LineChart(self, "E/S de disco (por segundo)", fmt_rate)
-        self.usage.grid(row=1, column=0, sticky="nsew", padx=(0, 5), pady=(0, 5))
-        self.load.grid(row=1, column=1, sticky="nsew", padx=(5, 0), pady=(0, 5))
-        self.net.grid(row=2, column=0, sticky="nsew", padx=(0, 5), pady=(5, 0))
-        self.disk.grid(row=2, column=1, sticky="nsew", padx=(5, 0), pady=(5, 0))
+        self.usage = LineChart(self, "Uso de recursos (%)", percent, fixed_max=100, height=150)
+        self.load = LineChart(self, "Load average (1 min)", lambda v: fmt_num(v, 2), height=150)
+        self.net = LineChart(self, "Rede (por segundo)", fmt_rate, height=150, binary=True)
+        self.disk = LineChart(self, "E/S de disco (por segundo)", fmt_rate, height=150, binary=True)
+        self.steal = LineChart(self, "CPU steal e iowait (%)", lambda v: f"{fmt_num(v, 1)}%", height=150)
+        self.latency = LineChart(self, "Latência Windows → servidor (ms)", lambda v: f"{fmt_num(v, 0)} ms",
+                                 height=150)
+        for index, chart in enumerate((self.usage, self.load, self.net, self.disk, self.steal, self.latency)):
+            row, column = divmod(index, 2)
+            chart.grid(row=row + 1, column=column, sticky="nsew", padx=(0, 5) if column == 0 else (5, 0),
+                       pady=(0 if row == 0 else 5, 0 if row == 2 else 5))
 
     def _force(self) -> None:
         self._last_query = 0.0
@@ -973,6 +1023,8 @@ class HistoryTab(Tab):
                           window, bucket)
         self.disk.set_data(ts, [Series("Leitura", v["disk_read"], 0), Series("Escrita", v["disk_write"], 1)],
                            window, bucket)
+        self.steal.set_data(ts, [Series("Steal", v["steal"], 0), Series("iowait", v["iowait"], 1)], window, bucket)
+        self.latency.set_data(ts, [Series("Latência", v["latency"], 0)], window, bucket)
         retention = self.app.settings.history.retention_days
         self.info.configure(text=f"{len(series)} pontos · 1 ponto a cada {fmt_duration(bucket)} · "
                                  f"retenção {fmt_num(retention, 0)} dias")
@@ -1022,20 +1074,22 @@ class OverviewPanel(ctk.CTkFrame):
     def __init__(self, master, app: Dashboard) -> None:
         super().__init__(master, fg_color="transparent")
         self.app = app
-        self._problem_targets: dict[str, tuple[str, str | None]] = {}
+        #: chave do problema → (servidor, chave da carga, aba de destino)
+        self._problem_targets: dict[str, tuple[str, str | None, str | None]] = {}
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
         self.grid_rowconfigure(3, weight=1)
         _section_label(self, "Servidores").grid(row=0, column=0, sticky="w", pady=(0, 4))
         self.servers = DataTable(
             self,
-            [Column("name", "Servidor", 140), Column("conn", "Conexão", 105),
-             Column("cpu", "CPU", 55, anchor="e"), Column("mem", "Mem.", 60, anchor="e"),
-             Column("disk", "Disco", 65, anchor="e"), Column("load", "Load", 60, anchor="e"),
-             Column("net", "Rede ↓ / ↑", 165, anchor="e"), Column("uptime", "Uptime", 80, anchor="e"),
-             Column("ok", "Ativas", 70, anchor="e"), Column("bad", "Falhas", 70, anchor="e"),
-             Column("mix", "Cont./Pods/VMs", 145, anchor="e"), Column("alerts", "Alertas", 180, True)],
-            tree_column=Column("health", "Saúde", 105),
+            [Column("name", "Servidor", 115), Column("conn", "Conexão", 110),
+             Column("cpu", "CPU", 50, anchor="e"), Column("mem", "Mem", 55, anchor="e"),
+             Column("disk", "Disco", 60, anchor="e"), Column("load", "Load", 52, anchor="e"),
+             Column("net", "Rede ↓ / ↑", 145, anchor="e"), Column("latency", "Latência", 82, anchor="e"),
+             Column("uptime", "Uptime", 72, anchor="e"), Column("ok", "Ativas", 66, anchor="e"),
+             Column("bad", "Falhas", 66, anchor="e"), Column("mix", "Cont/Pod/VM", 114, anchor="e"),
+             Column("security", "Segurança", 102, anchor="e"), Column("alerts", "Alertas", 110, True)],
+            tree_column=Column("health", "Saúde", 92),
             on_activate=self._open_server, export_name="servidores",
             menu_items=lambda: [("Abrir servidor", self._open_server)],
         )
@@ -1064,7 +1118,8 @@ class OverviewPanel(ctk.CTkFrame):
             counts = snapshot.counts() if snapshot else None
             mix = "—"
             if snapshot:
-                containers = snapshot.count_kind(ServiceKind.DOCKER) + snapshot.count_kind(ServiceKind.PODMAN)
+                containers = sum(snapshot.count_kind(k) for k in (ServiceKind.DOCKER, ServiceKind.PODMAN,
+                                                                   ServiceKind.LXD))
                 mix = (f"{containers} / {snapshot.count_kind(ServiceKind.KUBERNETES)} / "
                        f"{snapshot.count_kind(ServiceKind.LIBVIRT)}")
             alerts = ", ".join(snapshot.resource_alerts) if snapshot else ""
@@ -1074,24 +1129,27 @@ class OverviewPanel(ctk.CTkFrame):
             if metrics and metrics.net_rx_bps is not None:
                 net = f"{fmt_rate(metrics.net_rx_bps)} / {fmt_rate(metrics.net_tx_bps)}"
             failed = (counts[ServiceStatus.FAILED] + counts[ServiceStatus.DEGRADED]) if counts else None
+            latency = snapshot.latency_ms if snapshot else None
+            score = snapshot.security.score if snapshot and snapshot.security else None
             server_rows.append(Row(
                 key=name, text=_HEALTH_LABEL[level], status=_HEALTH_STATUS[level],
                 values=(name, state, fmt_pct(metrics.cpu_percent) if metrics else "—",
                         fmt_pct(metrics.mem_percent) if metrics else "—",
                         fmt_pct(fullest.use_percent) if fullest else "—",
                         fmt_num(metrics.load_avg[0], 2) if metrics and metrics.load_avg else "—", net,
+                        "—" if latency is None else f"{fmt_num(latency, 0)} ms",
                         fmt_duration(metrics.uptime_seconds) if metrics else "—",
                         str(counts[ServiceStatus.ACTIVE]) if counts else "—",
-                        "—" if failed is None else str(failed), mix, alerts),
+                        "—" if failed is None else str(failed), mix, "—" if score is None else f"{score}/100", alerts),
                 sort=(-level, name, state, metrics.cpu_percent if metrics else None,
                       metrics.mem_percent if metrics else None, fullest.use_percent if fullest else None,
                       metrics.load_avg[0] if metrics and metrics.load_avg else None,
-                      metrics.net_rx_bps if metrics else None, metrics.uptime_seconds if metrics else None,
-                      counts[ServiceStatus.ACTIVE] if counts else None, failed, mix, alerts or None),
+                      metrics.net_rx_bps if metrics else None, latency, metrics.uptime_seconds if metrics else None,
+                      counts[ServiceStatus.ACTIVE] if counts else None, failed, mix, score, alerts or None),
             ))
             if event is not None and event.state is ConnectionState.RECONNECTING:
                 key = f"{name}|offline"
-                self._problem_targets[key] = (name, None)
+                self._problem_targets[key] = (name, None, None)
                 problem_rows.append(Row(key=key, text="Offline", status=ServiceStatus.FAILED,
                                         values=(name, name, "Servidor", "Sem conexão SSH", event.message),
                                         sort=((ServiceStatus.FAILED.severity, -1), name, name, "Servidor", "",
@@ -1100,7 +1158,7 @@ class OverviewPanel(ctk.CTkFrame):
                 continue
             for alert in snapshot.resource_alerts:
                 key = f"{name}|res|{alert}"
-                self._problem_targets[key] = (name, None)
+                self._problem_targets[key] = (name, None, None)
                 problem_rows.append(Row(key=key, text="Limite", status=ServiceStatus.DEGRADED,
                                         values=(name, alert, "Recurso", "acima do limite configurado", ""),
                                         sort=((ServiceStatus.DEGRADED.severity, 2), name, alert, "Recurso", "",
@@ -1109,7 +1167,7 @@ class OverviewPanel(ctk.CTkFrame):
                 if service.status not in (ServiceStatus.FAILED, ServiceStatus.DEGRADED):
                     continue
                 key = f"{name}|{service.key}"
-                self._problem_targets[key] = (name, service.key)
+                self._problem_targets[key] = (name, service.key, None)
                 problem_rows.append(Row(
                     key=key, text=service.status.label, status=service.status,
                     values=(name, service.name + ("  ★" if service.critical else ""), service.type_label,
@@ -1117,6 +1175,7 @@ class OverviewPanel(ctk.CTkFrame):
                     sort=((service.status.severity, 0 if service.critical else 1), name, service.name,
                           service.type_label,
                           service.state_text, service.description)))
+            problem_rows += self._host_problems(name, snapshot)
         self.servers.set_rows(server_rows)
         self.problems.set_rows(problem_rows, "Nenhum problema detectado. Tudo em ordem.")
 
@@ -1125,15 +1184,38 @@ class OverviewPanel(ctk.CTkFrame):
         if name:
             self.app.select_server(name)
 
+    def _host_problems(self, name: str, snapshot: HostSnapshot) -> list[Row]:
+        """Endpoints fora do ar, discos com SMART ruim e falhas críticas de segurança."""
+        rows = []
+
+        def add(key: str, status: ServiceStatus, text: str, item: str, kind: str, state: str, detail: str,
+                tab: str) -> None:
+            self._problem_targets[key] = (name, None, tab)
+            rows.append(Row(key=key, text=text, status=status, values=(name, item, kind, state, detail),
+                            sort=((status.severity, 3), name, item, kind, state, detail)))
+
+        for endpoint in snapshot.failing_endpoints():
+            add(f"{name}|endpoint|{endpoint.target}", endpoint.status, endpoint.status.label, endpoint.target,
+                "Endpoint", "fora do ar" if endpoint.status is ServiceStatus.FAILED else "atenção", endpoint.detail,
+                "VPS")
+        for disk in snapshot.smart.disks if snapshot.smart else ():
+            if disk.status in (ServiceStatus.FAILED, ServiceStatus.DEGRADED):
+                add(f"{name}|smart|{disk.device}", disk.status, disk.status.label, disk.device, "SMART",
+                    disk.model, ", ".join(disk.problems), "Sistema")
+        if snapshot.security is not None:
+            for check in snapshot.security.checks:
+                if check.level is CheckLevel.FAIL:
+                    add(f"{name}|security|{check.id}", ServiceStatus.DEGRADED, "Segurança", check.title,
+                        "Segurança", check.category, check.detail, "Segurança")
+        return rows
+
     def _open_problem(self) -> None:
         key = self.problems.selected_key()
         if key in self._problem_targets:
-            server, service_key = self._problem_targets[key]
-            self.app.select_server(server, focus_key=service_key)
+            server, service_key, tab = self._problem_targets[key]
+            self.app.select_server(server, focus_key=service_key, tab=tab)
 
     def clear(self) -> None:
         self.servers.clear()
         self.problems.clear()
 
-
-ALL_TABS = (ServicesTab, StacksTab, ProcessesTab, NetworkTab, SchedulesTab, EventsTab, SystemTab, HistoryTab)

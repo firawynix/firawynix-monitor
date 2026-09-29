@@ -17,6 +17,7 @@ class ServiceKind(StrEnum):
     PODMAN = "podman"
     KUBERNETES = "k8s"
     LIBVIRT = "vm"
+    LXD = "lxd"
 
     @property
     def label(self) -> str:
@@ -33,6 +34,7 @@ _KIND_LABELS = {
     ServiceKind.PODMAN: "Podman",
     ServiceKind.KUBERNETES: "Kubernetes",
     ServiceKind.LIBVIRT: "VM",
+    ServiceKind.LXD: "LXD/Incus",
 }
 
 #: Tipos de unidade systemd coletados por padrão.
@@ -119,12 +121,16 @@ class ServiceInfo:
         """``service``/``timer``/... para systemd; o tipo da carga nos demais casos."""
         if self.kind is ServiceKind.SYSTEMD:
             return self.name.rsplit(".", 1)[-1] if "." in self.name else "service"
+        if self.kind is ServiceKind.LXD:
+            return "vm" if self.meta_value("type") == "virtual-machine" else "container"
         return {ServiceKind.KUBERNETES: "pod", ServiceKind.LIBVIRT: "vm"}.get(self.kind, "container")
 
     @property
     def type_label(self) -> str:
         if self.kind is ServiceKind.SYSTEMD:
             return self.unit_type
+        if self.kind is ServiceKind.LXD:
+            return "VM LXD" if self.unit_type == "vm" else "LXC"
         return {ServiceKind.KUBERNETES: "Pod", ServiceKind.LIBVIRT: "VM"}.get(self.kind, self.kind.label)
 
     @property
@@ -181,6 +187,9 @@ class HostMetrics:
     load_avg: tuple[float, float, float] | None = None
     cpu_count: int | None = None
     cpu_percent: float | None = None
+    #: Tempo "roubado" pelo hipervisor (VPS com vizinhos barulhentos) e espera de E/S, em %.
+    cpu_steal: float | None = None
+    cpu_iowait: float | None = None
     mem_total_mb: int | None = None
     mem_used_mb: int | None = None
     mem_available_mb: int | None = None
@@ -353,6 +362,266 @@ class UpdatesInfo:
     security: int | None = None
 
 
+# ---------------------------------------------------------------------------
+# VPS, SMART, endpoints e segurança
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class BandwidthUsage:
+    """Tráfego acumulado no mês (vnStat) — base da franquia cobrada pelo provedor."""
+
+    interface: str
+    period: str
+    rx_bytes: int
+    tx_bytes: int
+    today_rx: int | None = None
+    today_tx: int | None = None
+
+    @property
+    def total_bytes(self) -> int:
+        return self.rx_bytes + self.tx_bytes
+
+
+@dataclass(frozen=True, slots=True)
+class OomKill:
+    timestamp: float
+    process: str
+
+
+@dataclass(frozen=True, slots=True)
+class VpsInfo:
+    provider: str = ""
+    product: str = ""
+    ntp_synchronized: bool | None = None
+    ntp_service: str = ""
+    #: Diferença para a referência NTP (chrony), em segundos.
+    clock_offset: float | None = None
+    dns_servers: tuple[str, ...] = ()
+    default_gateway: str = ""
+    swappiness: int | None = None
+    oom_kills: tuple[OomKill, ...] = ()
+    #: None = sem acesso ao journal do kernel.
+    oom_kills_24h: int | None = None
+    bandwidth: tuple[BandwidthUsage, ...] = ()
+    #: "" = vnStat ausente (o tráfego mensal não é contabilizado).
+    bandwidth_source: str = ""
+
+    def bandwidth_total(self, count: str = "tx") -> int | None:
+        if not self.bandwidth:
+            return None
+        return sum(b.tx_bytes if count == "tx" else b.total_bytes for b in self.bandwidth)
+
+
+@dataclass(frozen=True, slots=True)
+class SmartDisk:
+    device: str
+    model: str = ""
+    serial: str = ""
+    capacity_bytes: int | None = None
+    #: True = aprovado, False = reprovado (disco condenado), None = não informado.
+    passed: bool | None = None
+    temperature: float | None = None
+    power_on_hours: int | None = None
+    reallocated: int | None = None
+    pending: int | None = None
+    uncorrectable: int | None = None
+    media_errors: int | None = None
+    percentage_used: int | None = None
+    critical_warning: int | None = None
+    message: str = ""
+
+    @property
+    def status(self) -> ServiceStatus:
+        if self.passed is False or self.critical_warning:
+            return ServiceStatus.FAILED
+        if self.passed is None:
+            return ServiceStatus.UNKNOWN
+        if any(v for v in (self.reallocated, self.pending, self.uncorrectable, self.media_errors)) \
+                or (self.percentage_used or 0) >= 90:
+            return ServiceStatus.DEGRADED
+        return ServiceStatus.ACTIVE
+
+    @property
+    def problems(self) -> list[str]:
+        items = []
+        if self.passed is False:
+            items.append("autoteste SMART REPROVADO")
+        if self.critical_warning:
+            items.append(f"alerta crítico NVMe 0x{self.critical_warning:02x}")
+        for value, label in ((self.reallocated, "setores realocados"), (self.pending, "setores pendentes"),
+                             (self.uncorrectable, "setores irrecuperáveis"), (self.media_errors, "erros de mídia")):
+            if value:
+                items.append(f"{value} {label}")
+        if (self.percentage_used or 0) >= 90:
+            items.append(f"desgaste {self.percentage_used}%")
+        return items
+
+
+@dataclass(frozen=True, slots=True)
+class SmartReport:
+    state: RuntimeState
+    disks: tuple[SmartDisk, ...] = ()
+    message: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class EndpointResult:
+    """Verificação feita a partir do Windows (HTTP, certificado TLS ou porta TCP)."""
+
+    target: str
+    scheme: str
+    status: ServiceStatus
+    latency_ms: float | None = None
+    http_status: int | None = None
+    cert_expires: float | None = None
+    cert_days_left: float | None = None
+    cert_issuer: str = ""
+    cert_subject: str = ""
+    cert_valid: bool | None = None
+    detail: str = ""
+    checked_at: float = field(default_factory=time.time)
+
+
+class CheckLevel(StrEnum):
+    OK = "ok"
+    INFO = "info"
+    WARN = "warn"
+    FAIL = "fail"
+    UNKNOWN = "unknown"
+
+    @property
+    def label(self) -> str:
+        return {"ok": "OK", "info": "Info", "warn": "Atenção", "fail": "Crítico", "unknown": "Indeterminado"}[
+            self.value]
+
+    @property
+    def status(self) -> ServiceStatus:
+        """Reaproveita as cores/ícones de status da interface."""
+        return {"ok": ServiceStatus.ACTIVE, "info": ServiceStatus.STOPPED, "warn": ServiceStatus.DEGRADED,
+                "fail": ServiceStatus.FAILED, "unknown": ServiceStatus.UNKNOWN}[self.value]
+
+
+@dataclass(frozen=True, slots=True)
+class SecurityCheck:
+    id: str
+    category: str
+    title: str
+    level: CheckLevel
+    detail: str
+    recommendation: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class Fail2banJail:
+    name: str
+    currently_failed: int | None = None
+    total_failed: int | None = None
+    currently_banned: int | None = None
+    total_banned: int | None = None
+    banned_ips: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class LoginEvent:
+    timestamp: float
+    user: str
+    source: str
+    method: str
+
+
+@dataclass(frozen=True, slots=True)
+class FailedLoginSource:
+    source: str
+    count: int
+    last_seen: float
+    last_user: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class SshLoginReport:
+    accepted: tuple[LoginEvent, ...] = ()
+    failed_sources: tuple[FailedLoginSource, ...] = ()
+    failed_total: int = 0
+    #: False = usuário sem acesso ao journal completo (contagens parciais).
+    complete: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class SudoEvent:
+    timestamp: float
+    user: str
+    command: str
+    #: "ok", "negado" (fora do sudoers) ou "senha incorreta".
+    outcome: str = "ok"
+    run_as: str = ""
+    tty: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class SessionInfo:
+    user: str
+    tty: str
+    source: str
+    since: str
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizedKey:
+    key_type: str
+    bits: int | None
+    fingerprint: str
+    comment: str
+    restricted: bool
+
+
+@dataclass(frozen=True, slots=True)
+class SecurityRaw:
+    """Dados brutos da auditoria (interpretados por :mod:`core.security`)."""
+
+    sshd: dict[str, str] = field(default_factory=dict)
+    #: "sshd -T" (configuração efetiva) ou "arquivos" (sshd_config lido sem root).
+    sshd_source: str = ""
+    #: Estado (``systemctl is-active``) de firewall, fail2ban, auditd, sshd...
+    services: dict[str, str] = field(default_factory=dict)
+    binaries: frozenset[str] = frozenset()
+    #: IP do próprio monitor visto pelo servidor ($SSH_CLIENT): nunca pode ser banido.
+    ssh_client: str = ""
+    ufw_enabled: bool | None = None
+    ufw_status: str = ""
+    iptables_rules: int | None = None
+    iptables_input_policy: str = ""
+    nft_rules: int | None = None
+    uid0_users: tuple[str, ...] = ()
+    login_users: tuple[str, ...] = ()
+    sudo_users: tuple[str, ...] = ()
+    sysctl: dict[str, str] = field(default_factory=dict)
+    apparmor: bool | None = None
+    selinux: str = ""
+    #: Valor de APT::Periodic::Unattended-Upgrade (None = não é Debian/Ubuntu).
+    auto_updates: str | None = None
+    tmp_mode: str = ""
+    sessions: tuple[SessionInfo, ...] = ()
+    authorized_keys: tuple[AuthorizedKey, ...] = ()
+    fail2ban: tuple[Fail2banJail, ...] = ()
+    #: None = sem dados (fail2ban ausente ou sem sudo), "" = OK, texto = erro.
+    fail2ban_error: str | None = None
+
+
+@dataclass(frozen=True)
+class SecurityReport:
+    checks: tuple[SecurityCheck, ...]
+    score: int | None
+    raw: SecurityRaw
+    logins: SshLoginReport | None = None
+    sudo: tuple[SudoEvent, ...] = ()
+
+    def count(self, level: CheckLevel) -> int:
+        return sum(1 for check in self.checks if check.level is level)
+
+    def check(self, check_id: str) -> SecurityCheck | None:
+        return next((c for c in self.checks if c.id == check_id), None)
+
+
 @dataclass(frozen=True, slots=True)
 class Stack:
     """Projeto do Docker/Podman Compose ou namespace do Kubernetes."""
@@ -431,6 +700,13 @@ class HostSnapshot:
     events: tuple[JournalEntry, ...] = ()
     system: SystemInfo | None = None
     updates: UpdatesInfo | None = None
+    vps: VpsInfo | None = None
+    smart: SmartReport | None = None
+    security: SecurityReport | None = None
+    endpoints: tuple[EndpointResult, ...] = ()
+    #: Latência medida a partir do Windows (ICMP) ou pela abertura de canais SSH.
+    latency_ms: float | None = None
+    latency_method: str = ""
     warnings: tuple[str, ...] = ()
     #: Limites de recurso atualmente excedidos (ex.: "CPU 97%").
     resource_alerts: tuple[str, ...] = ()
@@ -439,6 +715,8 @@ class HostSnapshot:
     #: Momento da última coleta de detalhes (processos, portas) e de inventário.
     detail_at: float | None = None
     inventory_at: float | None = None
+    security_at: float | None = None
+    endpoints_at: float | None = None
 
     def counts(self) -> Counter[ServiceStatus]:
         return Counter(service.status for service in self.services)
@@ -457,6 +735,9 @@ class HostSnapshot:
 
     def stacks(self) -> list[Stack]:
         return build_stacks(self.services)
+
+    def failing_endpoints(self) -> list[EndpointResult]:
+        return [e for e in self.endpoints if e.status in (ServiceStatus.FAILED, ServiceStatus.DEGRADED)]
 
 
 class ConnectionState(StrEnum):
@@ -540,6 +821,20 @@ class ThresholdAlertEvent(MonitorEvent):
     label: str
     value: float
     threshold: float
+    recovered: bool = False
+    unit: str = "%"
+
+
+@dataclass(frozen=True, kw_only=True)
+class HostAlertEvent(MonitorEvent):
+    """Alertas diversos: endpoints, SMART, segurança, franquia de tráfego, logins."""
+
+    category: str
+    key: str
+    title: str
+    message: str
+    #: "critical", "warning" ou "info".
+    level: str = "warning"
     recovered: bool = False
 
 

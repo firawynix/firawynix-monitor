@@ -4,7 +4,8 @@
 #   sudo visudo -f /etc/sudoers.d/firawynix-monitor
 #
 # Confirme os caminhos absolutos no servidor e ajuste abaixo:
-#   command -v systemctl docker podman kubectl k3s virsh ss kill
+#   command -v systemctl docker podman kubectl k3s virsh ss kill incus lxc \
+#              sshd ufw iptables nft fail2ban-client smartctl
 #
 # O Firawynix Monitor executa EXATAMENTE estes comandos, sempre com "sudo -n"
 # (não interativo: se o sudoers exigir senha, a ação falha na hora e a
@@ -22,6 +23,13 @@
 #   libvirt_sudo  virsh -c <uri> -q list --all | start|shutdown|reboot|dominfo <vm>
 #   network_sudo  ss -tulnp            (mostra o processo dono de cada porta)
 #   process_sudo  kill -TERM|-KILL <pid>
+#   lxd_sudo      incus|lxc list --format json | start|stop|restart <instância>
+#                 incus|lxc info --show-log <instância>
+#   security_sudo sshd -T | ufw status verbose | iptables -S INPUT | nft list ruleset
+#                 fail2ban-client status | fail2ban-client status <jail>
+#   security_actions (exige security_sudo)
+#                 fail2ban-client set <jail> banip|unbanip <ip>
+#   smart_sudo    smartctl -j -H -A -i -d <tipo> <dispositivo>
 #
 # O usuário "monitor" é apenas um exemplo: use o mesmo "username" do servers.json.
 
@@ -73,6 +81,43 @@ monitor ALL=(root) NOPASSWD: FWX_NGINX, FWX_APP
 # monitor ALL=(root) NOPASSWD: FWX_VM
 
 # ---------------------------------------------------------------------------
+# Auditoria de segurança (security_sudo: true) — somente leitura. Sem ela a
+# auditoria continua funcionando, mas não lê a configuração efetiva do sshd em
+# RHEL (sshd_config 0600), as regras de iptables/nftables nem o fail2ban.
+# ---------------------------------------------------------------------------
+# Cmnd_Alias FWX_AUDIT = /usr/sbin/sshd -T, /usr/sbin/ufw status verbose, \
+#                        /usr/sbin/iptables -S INPUT, /usr/sbin/nft list ruleset, \
+#                        /usr/bin/fail2ban-client status, /usr/bin/fail2ban-client status *
+# monitor ALL=(root) NOPASSWD: FWX_AUDIT
+
+# ---------------------------------------------------------------------------
+# Banir/desbanir IPs pela interface (security_actions: true). Libere só as jails
+# desejadas. O monitor recusa banir o próprio IP (evita se trancar para fora).
+# ---------------------------------------------------------------------------
+# Cmnd_Alias FWX_F2B = /usr/bin/fail2ban-client set sshd banip *, \
+#                      /usr/bin/fail2ban-client set sshd unbanip *
+# monitor ALL=(root) NOPASSWD: FWX_F2B
+
+# ---------------------------------------------------------------------------
+# SMART (smart_sudo: true). Opção A (recomendada): discos exatos, como aparecem
+# em "smartctl --scan" ("scsi" vira "auto"):
+# ---------------------------------------------------------------------------
+# Cmnd_Alias FWX_SMART = /usr/sbin/smartctl -j -H -A -i -d auto /dev/sda, \
+#                        /usr/sbin/smartctl -j -H -A -i -d nvme /dev/nvme0
+# monitor ALL=(root) NOPASSWD: FWX_SMART
+# Opção B (qualquer disco). Atenção: o "*" também casaria opções extras
+# (ex.: "-s off"), por isso prefira a opção A em servidores críticos.
+# monitor ALL=(root) NOPASSWD: /usr/sbin/smartctl -j -H -A -i -d * /dev/*
+
+# ---------------------------------------------------------------------------
+# LXD/Incus: prefira o grupo (sudo usermod -aG incus-admin monitor, ou lxd).
+# Com lxd_sudo: true:
+# ---------------------------------------------------------------------------
+# Cmnd_Alias FWX_LXD = /usr/bin/incus list --format json, /usr/bin/incus info --show-log *, \
+#                      /usr/bin/incus start *, /usr/bin/incus stop *, /usr/bin/incus restart *
+# monitor ALL=(root) NOPASSWD: FWX_LXD
+
+# ---------------------------------------------------------------------------
 # NÃO recomendado: "kill" via sudo equivale a poder encerrar qualquer processo
 # (inclusive o sshd). Sem process_sudo, o monitor só encerra processos do
 # próprio usuário SSH — o que costuma bastar para workers e scripts.
@@ -84,4 +129,5 @@ monitor ALL=(root) NOPASSWD: FWX_NGINX, FWX_APP
 #   sudo usermod -aG systemd-journal monitor   # logs e eventos de todos os serviços
 #   sudo usermod -aG docker monitor            # ATENÇÃO: grupo docker ≈ acesso root
 #   sudo usermod -aG libvirt monitor           # listar/controlar VMs
+#   sudo usermod -aG incus-admin monitor       # Incus (ou "lxd" no LXD) — também ≈ root
 # ---------------------------------------------------------------------------

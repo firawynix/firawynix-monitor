@@ -23,8 +23,10 @@ HEALTH_COLORS = {
     HealthLevel.WARNING: "#f1c40f",
     HealthLevel.CRITICAL: "#ff4d4f",
 }
-_BACKGROUND = "#161b22"
-_PULSE = "#58a6ff"
+# Tema ciano: fundo petróleo escuro e linha de batimento ciano.
+_BACKGROUND = "#081317"
+_BORDER = "#0e7490"
+_PULSE = "#22d3ee"
 ICO_SIZES = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
 
 
@@ -36,7 +38,7 @@ def create_icon_image(level: HealthLevel | None = None, size: int = 64) -> Image
     scale = 256
     image = Image.new("RGBA", (scale, scale), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((8, 8, scale - 8, scale - 8), radius=56, fill=_BACKGROUND)
+    draw.rounded_rectangle((8, 8, scale - 8, scale - 8), radius=56, fill=_BACKGROUND, outline=_BORDER, width=10)
     pulse = [(36, 140), (84, 140), (108, 84), (140, 196), (166, 116), (182, 140), (220, 140)]
     draw.line(pulse, fill=_PULSE, width=18, joint="curve")
     if level is not None:
@@ -66,8 +68,12 @@ class TrayIcon:
         on_refresh: Callable[[], None],
         on_toggle_mute: Callable[[bool], None],
         on_quit: Callable[[], None],
+        on_toggle_autostart: Callable[[bool], None] | None = None,
+        autostart_state: Callable[[], bool] | None = None,
     ) -> None:
         self.app_name = app_name
+        self._on_toggle_autostart = on_toggle_autostart
+        self._autostart_state = autostart_state
         self._on_open = on_open
         self._on_refresh = on_refresh
         self._on_toggle_mute = on_toggle_mute
@@ -94,6 +100,8 @@ class TrayIcon:
             pystray.MenuItem("Abrir painel", self._handle_open, default=True),
             pystray.MenuItem("Atualizar agora", self._handle_refresh),
             pystray.MenuItem("Silenciar alertas", self._handle_mute, checked=lambda _item: self._muted),
+            pystray.MenuItem("Iniciar com o Windows", self._handle_autostart, checked=lambda _item: self._autostart(),
+                             visible=self._on_toggle_autostart is not None),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Sair", self._handle_quit),
         )
@@ -134,11 +142,20 @@ class TrayIcon:
 
     def set_muted(self, muted: bool) -> None:
         self._muted = muted
+        self.refresh_menu()
+
+    def refresh_menu(self) -> None:
         if self._icon is not None:
             try:
                 self._icon.update_menu()
             except Exception:  # noqa: BLE001
                 pass
+
+    def _autostart(self) -> bool:
+        try:
+            return bool(self._autostart_state and self._autostart_state())
+        except Exception:  # noqa: BLE001
+            return False
 
     def notify(self, title: str, message: str) -> None:
         """Fallback de notificação (balão da bandeja)."""
@@ -162,6 +179,10 @@ class TrayIcon:
     def _handle_mute(self, _icon=None, _item=None) -> None:
         self._muted = not self._muted
         self._on_toggle_mute(self._muted)
+
+    def _handle_autostart(self, _icon=None, _item=None) -> None:
+        if self._on_toggle_autostart is not None:
+            self._on_toggle_autostart(not self._autostart())
 
     def _handle_quit(self, _icon=None, _item=None) -> None:
         self._on_quit()

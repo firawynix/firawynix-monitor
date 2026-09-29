@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import re
 import threading
@@ -26,19 +27,25 @@ from core.models import (
     ActionOutcome,
     ActionResult,
     CronEntry,
+    Fail2banJail,
     HostMetrics,
     JournalEntry,
     NetworkInfo,
     ProcessInfo,
     RuntimeResult,
     RuntimeState,
+    SecurityRaw,
     ServiceAction,
     ServiceInfo,
     ServiceKind,
+    SmartReport,
+    SshLoginReport,
     Stack,
+    SudoEvent,
     SystemInfo,
     TimerInfo,
     UpdatesInfo,
+    VpsInfo,
 )
 
 log = logging.getLogger(__name__)
@@ -131,6 +138,9 @@ class SSHClient:
         self._metrics_state: parsers.MetricsState | None = None
         self._process_sample: parsers.ProcessSample | None = None
         self._cgroup_sample: parsers.CgroupSample | None = None
+        self._lxd_sample: tuple[float, dict[str, int]] | None = None
+        #: Menor tempo de abertura de canal desde a última leitura (≈ RTT da rede).
+        self._rtt_min: float | None = None
 
     # -- conexão ----------------------------------------------------------
 
@@ -252,7 +262,9 @@ class SSHClient:
         channel: paramiko.Channel | None = None
         try:
             try:
+                opened = time.monotonic()
                 channel = transport.open_session(timeout=timeout)
+                self._record_rtt(time.monotonic() - opened)
                 channel.exec_command(cmd.wrap_remote_command(command))
                 channel.shutdown_write()  # EOF no stdin: nada fica esperando entrada
             except (paramiko.SSHException, OSError, EOFError) as exc:
@@ -297,6 +309,19 @@ class SSHClient:
         )
         log.debug("[%s] %s → %s em %.2fs", self.server.name, _short(command), exit_code, result.duration)
         return result
+
+    def _record_rtt(self, seconds: float) -> None:
+        # CHANNEL_OPEN → CONFIRMATION: um ida-e-volta sem criar processo no servidor
+        # (nenhum pacote extra, nenhuma linha no log do sshd).
+        with self._state_lock:
+            if self._rtt_min is None or seconds < self._rtt_min:
+                self._rtt_min = seconds
+
+    def take_rtt(self) -> float | None:
+        """Latência (ms) medida nos canais abertos desde a chamada anterior."""
+        with self._state_lock:
+            value, self._rtt_min = self._rtt_min, None
+        return None if value is None else value * 1000
 
     def _abort_transport(self, transport: paramiko.Transport, command: str) -> None:
         log.warning("[%s] watchdog: servidor não respondeu a %r; derrubando conexão",
@@ -387,6 +412,30 @@ class SSHClient:
             return RuntimeResult(kind, *parsers.classify_runtime_error(kind, result.exit_code, result.output))
         return RuntimeResult(kind, RuntimeState.OK, tuple(parsers.parse_virsh_list(result.stdout)))
 
+    def list_lxd(self) -> RuntimeResult:
+        kind = ServiceKind.LXD
+        if self.server.lxd == "off":
+            return RuntimeResult(kind, RuntimeState.DISABLED)
+        result = self.run(cmd.build_lxd_list_command(self._sudo(self.server.lxd_sudo)))
+        if not result.ok:
+            return RuntimeResult(kind, *parsers.classify_runtime_error(kind, result.exit_code, result.output))
+        try:
+            _cli, instances, usage = parsers.parse_lxd_list(result.stdout)
+        except ValueError as exc:
+            return RuntimeResult(kind, RuntimeState.ERROR, (), f"Saída inesperada do LXD/Incus: {exc}")
+        now = time.monotonic()
+        with self._state_lock:
+            previous, self._lxd_sample = self._lxd_sample, (now, usage)
+        if previous is not None and now > previous[0]:
+            elapsed_ns = (now - previous[0]) * 1e9
+            instances = [
+                dataclasses.replace(item, cpu_percent=max(0.0, 100.0 * (usage[item.name] - previous[1][item.name])
+                                                          / elapsed_ns))
+                if item.name in usage and item.name in previous[1] else item
+                for item in instances
+            ]
+        return RuntimeResult(kind, RuntimeState.OK, tuple(instances))
+
     def _runtime_config(self, runtime: ServiceKind) -> tuple[str, bool]:
         if runtime is ServiceKind.PODMAN:
             return self.server.podman, self._sudo(self.server.podman_sudo)
@@ -423,10 +472,35 @@ class SSHClient:
     def system_info(self) -> tuple[SystemInfo, dict[str, float]]:
         return parsers.parse_system_info(self.run(cmd.SYSTEM_INFO_CMD).stdout)
 
-    def ssh_failed_logins(self) -> int | None:
-        """Falhas de login SSH nas últimas 24 h (requer acesso ao journal)."""
-        text = self.run(cmd.SSH_FAILURES_CMD).stdout.strip()
-        return int(text) if text.isdigit() else None
+    def vps_info(self) -> VpsInfo:
+        return parsers.parse_vps(self.run(cmd.VPS_CMD).stdout)
+
+    def smart(self) -> SmartReport:
+        result = self.run(cmd.build_smart_command(self._sudo(self.server.smart_sudo)))
+        if result.exit_code == 127 or "command not found" in result.stderr:
+            return SmartReport(RuntimeState.NOT_INSTALLED, (), "smartctl não instalado (pacote smartmontools).")
+        return parsers.parse_smart(result.stdout)
+
+    def security_raw(self) -> SecurityRaw:
+        server = self.server
+        command = cmd.build_security_command(self._sudo(server.security_sudo),
+                                             privileged=server.security_sudo or server.username == "root")
+        return parsers.parse_security(self.run(command).stdout)
+
+    def fail2ban_status(self) -> tuple[tuple[Fail2banJail, ...], str]:
+        """Jails e IPs banidos (``fail2ban-client`` exige root: security_sudo)."""
+        result = self.run(cmd.build_fail2ban_status_command(self._sudo(self.server.security_sudo)))
+        if not result.ok:
+            hint = parsers.describe_sudo_failure(result.output)
+            first = result.output.strip().splitlines()[0] if result.output.strip() else f"código {result.exit_code}"
+            return (), hint or first[:200]
+        return parsers.parse_fail2ban(result.stdout), ""
+
+    def ssh_logins(self) -> SshLoginReport:
+        return parsers.parse_ssh_logins(self.run(cmd.SSH_LOGINS_CMD).stdout)
+
+    def sudo_log(self) -> tuple[SudoEvent, ...]:
+        return parsers.parse_sudo_log(self.run(cmd.build_sudo_log_command(self.server.username)).stdout)
 
     def updates(self) -> UpdatesInfo | None:
         return parsers.parse_updates(self.run(cmd.UPDATES_CMD).stdout)
@@ -445,6 +519,9 @@ class SSHClient:
         elif service.kind is ServiceKind.KUBERNETES:
             command = cmd.build_pod_restart_command(server.kubectl_command, service.name,
                                                     self._sudo(server.kubectl_sudo))
+        elif service.kind is ServiceKind.LXD:
+            command = cmd.build_lxd_action_command(service.meta_value("cli", "lxc"), service.name, action,
+                                                   self._sudo(server.lxd_sudo))
         else:
             command = cmd.build_vm_action_command(server.libvirt_uri, service.name, action,
                                                   self._sudo(server.libvirt_sudo))
@@ -463,6 +540,12 @@ class SSHClient:
             return ActionResult(ActionOutcome.ERROR, "Ações em processos estão desativadas (process_actions).")
         command = cmd.build_kill_command(pid, force, self._sudo(self.server.process_sudo))
         return self._run_action(command, "Forçar encerramento" if force else "Encerrar", f"PID {pid}")
+
+    def fail2ban_action(self, jail: str, ip: str, ban: bool) -> ActionResult:
+        if not self.server.security_actions:
+            return ActionResult(ActionOutcome.ERROR, "Ações no fail2ban estão desativadas (security_actions).")
+        command = cmd.build_fail2ban_ban_command(jail, ip, ban, self._sudo(self.server.security_sudo))
+        return self._run_action(command, "Banir" if ban else "Desbanir", f"{ip} (jail {jail})")
 
     def _run_action(self, command: str, label: str, target: str) -> ActionResult:
         try:
@@ -489,6 +572,9 @@ class SSHClient:
         if service.kind is ServiceKind.KUBERNETES:
             return cmd.build_pod_logs_command(server.kubectl_command, service.name, lines,
                                               self._sudo(server.kubectl_sudo))
+        if service.kind is ServiceKind.LXD:
+            return cmd.build_lxd_info_command(service.meta_value("cli", "lxc"), service.name,
+                                              self._sudo(server.lxd_sudo))
         return cmd.build_vm_info_command(server.libvirt_uri, service.name, self._sudo(server.libvirt_sudo))
 
     def service_logs(self, service: ServiceInfo, lines: int) -> str:

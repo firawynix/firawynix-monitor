@@ -32,6 +32,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--minimized", action="store_true", help="inicia oculto na bandeja do sistema")
     parser.add_argument("--demo", action="store_true", help="usa servidores simulados (sem SSH)")
     parser.add_argument("--debug", action="store_true", help="log detalhado")
+    parser.add_argument("--set-credential", metavar="SERVIDOR",
+                        help="grava a senha SSH do servidor no Gerenciador de Credenciais do Windows e sai")
+    parser.add_argument("--passphrase", action="store_true",
+                        help="com --set-credential/--delete-credential: passphrase da chave em vez da senha")
+    parser.add_argument("--delete-credential", metavar="SERVIDOR",
+                        help="remove a credencial do servidor do Gerenciador de Credenciais e sai")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser.parse_args(argv)
 
@@ -92,6 +98,46 @@ def open_history(settings, *, demo: bool):
     return store
 
 
+def manage_credential(config_path, server_name: str, *, passphrase: bool, delete: bool) -> int:
+    """CLI do Gerenciador de Credenciais. A senha é lida com getpass (sem eco) e
+    nunca aparece em argumentos de linha de comando, no histórico ou em log."""
+    import getpass
+
+    from config.settings import load_config
+    from core import winapi
+
+    if not winapi.IS_WINDOWS:
+        print("O Gerenciador de Credenciais só existe no Windows.", file=sys.stderr)
+        return 2
+    if sys.stdin is None or not sys.stdin.isatty():
+        # O .exe é um aplicativo de janela (sem console): não há onde digitar a senha.
+        show_fatal(APP_TITLE, "Sem console para digitar a senha. Use o botão \"Windows ⚙\" > Credenciais no "
+                              f"monitor, ou no PowerShell:\n\ncmdkey /generic:{winapi.credential_target(server_name)} "
+                              "/user:<usuario> /pass")
+        return 2
+    kind = "passphrase" if passphrase else "password"
+    target, username = winapi.credential_target(server_name, kind), ""
+    try:
+        server = load_config(find_config(config_path), load_env=False).server(server_name)
+        configured = server.key_passphrase_credential if passphrase else server.password_credential
+        target, username = configured or target, server.username
+    except (ConfigError, KeyError):
+        print(f"Aviso: servidor '{server_name}' não encontrado no servers.json; usando o nome padrão {target}.")
+    if delete:
+        removed = winapi.cred_delete(target)
+        print(f"Credencial {target} {'removida' if removed else 'não encontrada'}.")
+        return 0 if removed else 1
+    label = "Passphrase da chave" if passphrase else "Senha SSH"
+    secret = getpass.getpass(f"{label} para {server_name} ({target}): ")
+    if not secret or secret != getpass.getpass("Confirme: "):
+        print("Vazio ou não confere; nada foi gravado.", file=sys.stderr)
+        return 1
+    winapi.cred_write(target, secret, username)
+    key = "key_passphrase_credential" if passphrase else "password_credential"
+    print(f"Credencial gravada em {target}. No servers.json use \"{key}\": true (ou \"{target}\").")
+    return 0
+
+
 def show_fatal(title: str, message: str) -> None:
     log.error("%s: %s", title, message)
     try:
@@ -109,6 +155,9 @@ def show_fatal(title: str, message: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.set_credential or args.delete_credential:
+        return manage_credential(args.config, args.set_credential or args.delete_credential,
+                                 passphrase=args.passphrase, delete=bool(args.delete_credential))
     log_file = configure_logging(args.debug)
     log.info("%s %s iniciando (Python %s, log em %s)", APP_TITLE, __version__, sys.version.split()[0], log_file)
 
@@ -134,10 +183,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     # Imports de UI só depois da configuração validada (inicialização mais rápida em erro).
-    import customtkinter as ctk
-
+    from config.preferences import Preferences
+    from config.settings import user_config_dir
     from core.notifier import Notifier
     from ui.dashboard import Dashboard
+    from ui.theme import apply_theme
     from ui.tray import TrayIcon, export_app_icons
 
     settings = app_config.settings
@@ -147,8 +197,8 @@ def main(argv: list[str] | None = None) -> int:
     except OSError:
         log.warning("Não foi possível gerar os ícones da aplicação", exc_info=True)
 
-    ctk.set_appearance_mode(settings.appearance_mode)
-    ctk.set_default_color_theme("blue")
+    apply_theme(settings.appearance_mode)
+    preferences = Preferences(None if args.demo else user_config_dir() / "preferences.json")
 
     history = open_history(settings, demo=args.demo)
     if args.demo and history is not None:
@@ -167,7 +217,8 @@ def main(argv: list[str] | None = None) -> int:
         if history is not None:
             history.close()
 
-    app = Dashboard(app_config, manager, notifier, history=history, icon_path=icon_ico, on_quit=shutdown)
+    app = Dashboard(app_config, manager, notifier, history=history, icon_path=icon_ico, on_quit=shutdown,
+                    preferences=preferences)
     if args.demo:
         app.title(f"{APP_TITLE} — DEMONSTRAÇÃO")
 
@@ -178,6 +229,9 @@ def main(argv: list[str] | None = None) -> int:
             on_refresh=lambda: app.call_in_ui(app.refresh_all),
             on_toggle_mute=lambda muted: app.call_in_ui(lambda: app.set_muted(muted)),
             on_quit=lambda: app.call_in_ui(app.quit_app),
+            on_toggle_autostart=(lambda enabled: app.call_in_ui(lambda: app.set_autostart(enabled)))
+            if sys.platform == "win32" else None,
+            autostart_state=app.autostart_enabled,
         )
         if tray.start():
             app.attach_tray(tray)

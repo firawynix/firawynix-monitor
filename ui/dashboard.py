@@ -23,15 +23,19 @@ from pathlib import Path
 
 import customtkinter as ctk
 
+from config.preferences import Preferences
 from config.settings import Config, ServerConfig
+from core import winapi
 from core.history import HistoryStore
 from core.models import (
     ActionOutcome,
     ActionResultEvent,
     AlertKind,
+    CheckLevel,
     ConnectionEvent,
     ConnectionState,
     HealthLevel,
+    HostAlertEvent,
     HostSnapshot,
     MonitorEvent,
     ServiceAction,
@@ -45,7 +49,22 @@ from core.models import (
 )
 from core.monitor import MonitorManager
 from core.notifier import Notifier
-from ui.tabs import ALL_TABS, OverviewPanel, ServicesTab, Tab
+from ui import theme
+from ui.options import WindowsOptionsDialog
+from ui.security_tab import SecurityTab
+from ui.tabs import (
+    EventsTab,
+    HistoryTab,
+    NetworkTab,
+    OverviewPanel,
+    ProcessesTab,
+    SchedulesTab,
+    ServicesTab,
+    StacksTab,
+    SystemTab,
+    Tab,
+)
+from ui.vps_tab import VpsTab, fmt_latency
 from ui.widgets import (
     BANNER_ERROR,
     BANNER_INFO,
@@ -72,6 +91,8 @@ log = logging.getLogger(__name__)
 
 APP_TITLE = "Firawynix Monitor"
 OVERVIEW = "Visão geral"
+TABS = (ServicesTab, StacksTab, ProcessesTab, NetworkTab, VpsTab, SecurityTab, SchedulesTab, EventsTab, SystemTab,
+        HistoryTab)
 INTERVAL_OPTIONS = (2, 5, 10, 30, 60)
 CONNECTION_COLORS = {
     ConnectionState.CONNECTING: YELLOW,
@@ -88,9 +109,11 @@ class Dashboard(ctk.CTk):
 
     def __init__(self, app_config: Config, manager: MonitorManager, notifier: Notifier, *,
                  history: HistoryStore | None = None, icon_path: Path | None = None,
-                 on_quit: Callable[[], None] | None = None) -> None:
+                 on_quit: Callable[[], None] | None = None, preferences: Preferences | None = None) -> None:
         super().__init__()
         self._config = app_config
+        self.preferences = preferences or Preferences(None)
+        self._event_log = winapi.EventLog() if winapi.IS_WINDOWS else None
         self.manager = manager
         self.settings = app_config.settings
         self.history = history
@@ -124,6 +147,9 @@ class Dashboard(ctk.CTk):
         self._build_statusbar()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(300, lambda: theme.style_window(self, accent=self.settings.windows.accent_title_bar))
+        if self.windows_pref("prevent_sleep"):
+            winapi.prevent_sleep(True)
         self.bind("<F5>", lambda _e: self.refresh_current())
         self.bind("<Control-f>", lambda _e: self._focus_search())
         self.report_callback_exception = self._report_callback_exception
@@ -139,7 +165,11 @@ class Dashboard(ctk.CTk):
         header.grid_columnconfigure(0, weight=1)
         brand = ctk.CTkFrame(header, fg_color="transparent")
         brand.grid(row=0, column=0, sticky="w")
-        ctk.CTkLabel(brand, text=APP_TITLE, anchor="w", font=ctk.CTkFont(size=22, weight="bold")).pack(anchor="w")
+        title = ctk.CTkFrame(brand, fg_color="transparent")
+        title.pack(anchor="w")
+        ctk.CTkLabel(title, text="◆", text_color=theme.ACCENT_TEXT, font=ctk.CTkFont(size=20)).pack(side="left",
+                                                                                                 padx=(0, 8))
+        ctk.CTkLabel(title, text=APP_TITLE, anchor="w", font=ctk.CTkFont(size=22, weight="bold")).pack(side="left")
         self._overview_label = ctk.CTkLabel(brand, text="", anchor="w", text_color=GRAY)
         self._overview_label.pack(anchor="w")
 
@@ -152,9 +182,11 @@ class Dashboard(ctk.CTk):
         self._conn_badge = ctk.CTkLabel(controls, text="", width=240, anchor="w")
         self._conn_badge.pack(side="left", padx=(0, 8))
         self._terminal_btn = ctk.CTkButton(controls, text="Terminal SSH", width=110, command=self.open_terminal,
-                                           fg_color=("gray70", "gray30"), hover_color=("gray60", "gray35"),
-                                           text_color=("gray10", "gray95"))
-        self._terminal_btn.pack(side="left", padx=(0, 12))
+                                           fg_color=theme.NEUTRAL, hover_color=theme.NEUTRAL_HOVER,
+                                           text_color=theme.TEXT)
+        self._terminal_btn.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(controls, text="Windows ⚙", width=104, command=self.open_options, fg_color=theme.NEUTRAL,
+                      hover_color=theme.NEUTRAL_HOVER, text_color=theme.TEXT).pack(side="left", padx=(0, 12))
         ctk.CTkLabel(controls, text="Intervalo").pack(side="left", padx=(0, 6))
         interval = self.settings.poll_interval_seconds
         options = sorted({*INTERVAL_OPTIONS, int(interval) if float(interval).is_integer() else interval})
@@ -196,7 +228,7 @@ class Dashboard(ctk.CTk):
         self._tabview = ctk.CTkTabview(content, anchor="w", command=self.render_current_tab)
         self._tabview.grid(row=0, column=0, sticky="nsew")
         self._tabs: dict[str, Tab] = {}
-        for tab_cls in ALL_TABS:
+        for tab_cls in TABS:
             frame = self._tabview.add(tab_cls.title)
             tab = tab_cls(frame, self)
             tab.pack(fill="both", expand=True)
@@ -221,6 +253,10 @@ class Dashboard(ctk.CTk):
 
     def server_config(self, name: str) -> ServerConfig:
         return self._config.server(name)
+
+    @property
+    def current_server(self) -> str | None:
+        return self._current
 
     def busy_label(self, server: str, key: str) -> str | None:
         return self._busy.get(f"{server}|{key}")
@@ -288,6 +324,21 @@ class Dashboard(ctk.CTk):
         self._mark_busy(server, f"pid:{pid}", "Encerrando", f"PID {pid}")
         self.manager.kill_process(server, pid, force)
 
+    def fail2ban_action(self, server: str, jail: str, ip: str, ban: bool) -> None:
+        if not self._ensure_connected(server):
+            return
+        if ban:
+            title, verb = f"Banir {ip}", "Banir"
+            message = (f"Banir {ip} na jail \"{jail}\" do fail2ban em {server}?\n\nO IP fica bloqueado pelo tempo "
+                       "de banimento configurado na jail (bantime).")
+        else:
+            title, verb = f"Desbanir {ip}", "Desbanir"
+            message = f"Remover {ip} da jail \"{jail}\" em {server}? O acesso a partir dele volta a ser permitido."
+        if not self.confirm(title, message, verb, danger=ban):
+            return
+        self._mark_busy(server, f"ip:{ip}", "Banindo" if ban else "Desbanindo", ip)
+        self.manager.fail2ban_action(server, jail, ip, ban)
+
     def open_logs(self, server: str, service: ServiceInfo) -> None:
         title = "Detalhes" if service.kind is ServiceKind.LIBVIRT else "Logs"
         self.show_text(f"{title} — {service.name} @ {server}", subtitle=f"{service.name}  ·  {server}",
@@ -311,6 +362,39 @@ class Dashboard(ctk.CTk):
         self.render_current_tab()
 
     # -- API pública (tray / main) --------------------------------------------
+
+    def windows_pref(self, key: str) -> bool:
+        return bool(self.preferences.get(f"windows.{key}", getattr(self.settings.windows, key)))
+
+    def set_windows_pref(self, key: str, enabled: bool) -> None:
+        self.preferences.set(f"windows.{key}", enabled)
+        if key == "prevent_sleep":
+            winapi.prevent_sleep(enabled)
+        self.set_status(f"Opção do Windows '{key}' {'ativada' if enabled else 'desativada'}.")
+
+    def autostart_enabled(self) -> bool:
+        return winapi.autostart_enabled()
+
+    def set_autostart(self, enabled: bool) -> bool:
+        ok = winapi.set_autostart(enabled, winapi.autostart_command(self._config.source))
+        if ok:
+            self.set_status("Iniciará com o Windows." if enabled else "Não iniciará mais com o Windows.")
+            if self._tray is not None:
+                self._tray.refresh_menu()
+        else:
+            self.set_status("Não foi possível alterar a inicialização com o Windows.", error=True)
+        return ok
+
+    def log_windows_event(self, message: str, level: str = "info", category: str = "app") -> None:
+        if self._event_log is not None and self.windows_pref("event_log"):
+            self._event_log.write(message, level, category)
+
+    def _flash(self, critical: bool) -> None:
+        if critical and self.windows_pref("flash_taskbar") and self.state() != "withdrawn":
+            winapi.flash_taskbar(self)
+
+    def open_options(self) -> None:
+        WindowsOptionsDialog(self)
 
     def call_in_ui(self, fn: Callable[[], None]) -> None:
         """Thread-safe: agenda ``fn`` para a thread da UI."""
@@ -369,6 +453,10 @@ class Dashboard(ctk.CTk):
             return
         self._quitting = True
         log.info("Encerrando aplicação")
+        if self.windows_pref("prevent_sleep"):
+            winapi.prevent_sleep(False)
+        if self._event_log is not None:
+            self._event_log.close()
         if self._on_quit is not None:
             try:
                 self._on_quit()
@@ -406,13 +494,16 @@ class Dashboard(ctk.CTk):
             return
         self.set_status(f"Terminal aberto: {command_line}")
 
-    def select_server(self, name: str | None, focus_key: str | None = None) -> None:
+    def select_server(self, name: str | None, focus_key: str | None = None, tab: str | None = None) -> None:
         if name != self._current:
-            for tab in self._tabs.values():
-                tab.reset()
+            for current in self._tabs.values():
+                current.reset()
         self._current = name
         self._apply_selection()
-        if name is not None and focus_key is not None:
+        if name is not None and tab in self._tabs:
+            self._tabview.set(tab)
+            self.render_current_tab()
+        elif name is not None and focus_key is not None:
             self._tabview.set(ServicesTab.title)
             services = self._tabs[ServicesTab.title]
             if isinstance(services, ServicesTab):
@@ -473,6 +564,9 @@ class Dashboard(ctk.CTk):
             self._conn_badge.configure(text="● Aguardando…", text_color=GRAY)
             return
         text = f"● {event.state.label}"
+        snapshot = self._snapshots.get(self._current)
+        if event.state is ConnectionState.CONNECTED and snapshot is not None and snapshot.latency_ms is not None:
+            text += f" · {fmt_latency(snapshot.latency_ms, snapshot.latency_method)}"
         if event.state is ConnectionState.RECONNECTING and event.retry_in is not None:
             remaining = event.timestamp + event.retry_in - time.time()
             text += f" · nova tentativa em {int(remaining) + 1} s" if remaining > 0.5 else " · reconectando…"
@@ -487,7 +581,8 @@ class Dashboard(ctk.CTk):
             parts = [f"{counts[ServiceStatus.STOPPED]} paradas", f"{len(snapshot.services)} total"]
             containers = snapshot.count_kind(ServiceKind.DOCKER) + snapshot.count_kind(ServiceKind.PODMAN)
             for count, label in ((containers, "contêineres"), (snapshot.count_kind(ServiceKind.KUBERNETES), "pods"),
-                                 (snapshot.count_kind(ServiceKind.LIBVIRT), "VMs")):
+                                 (snapshot.count_kind(ServiceKind.LIBVIRT), "VMs"),
+                                 (snapshot.count_kind(ServiceKind.LXD), "LXD")):
                 if count:
                     parts.append(f"{count} {label}")
             self._counts_card.set_counts(counts[ServiceStatus.ACTIVE],
@@ -503,8 +598,14 @@ class Dashboard(ctk.CTk):
         load_text = f"Load {' · '.join(fmt_num(v, 2) for v in load)}" if load else "Load —"
         if metrics.cpu_count:
             load_text += f"  ({metrics.cpu_count} vCPU)"
+        steal, iowait = metrics.cpu_steal, metrics.cpu_iowait
+        note, note_color = "", GRAY
+        if steal is not None and (steal >= 0.5 or (iowait or 0) >= 5):
+            note = f"steal {fmt_num(steal, 1)}% · iowait {fmt_num(iowait or 0, 1)}%"
+            limit = self.settings.thresholds.steal_percent
+            note_color = RED if limit and steal >= limit else YELLOW if steal >= 2 else GRAY
         self._cpu_card.set_values(f"{cpu:.0f}%" if cpu is not None else "…", load_text,
-                                  (cpu or 0) / 100, usage_color(cpu))
+                                  (cpu or 0) / 100, usage_color(cpu), note=note, note_color=note_color)
 
         mem_pct = metrics.mem_percent
         swap = metrics.swap_percent
@@ -596,9 +697,14 @@ class Dashboard(ctk.CTk):
             return HealthLevel.UNKNOWN
         if snapshot.failed_critical():
             return HealthLevel.CRITICAL
+        if any(e.status is ServiceStatus.FAILED for e in snapshot.endpoints):
+            return HealthLevel.CRITICAL
+        if snapshot.smart is not None and any(d.status is ServiceStatus.FAILED for d in snapshot.smart.disks):
+            return HealthLevel.CRITICAL
         counts = snapshot.counts()
+        security_fail = snapshot.security is not None and snapshot.security.count(CheckLevel.FAIL) > 0
         if (counts[ServiceStatus.FAILED] or counts[ServiceStatus.DEGRADED] or snapshot.warnings
-                or snapshot.resource_alerts):
+                or snapshot.resource_alerts or snapshot.failing_endpoints() or security_fail):
             return HealthLevel.WARNING
         return HealthLevel.OK
 
@@ -667,6 +773,9 @@ class Dashboard(ctk.CTk):
             alerts.append(event)
         elif isinstance(event, ThresholdAlertEvent):
             self._notify_threshold(event)
+        elif isinstance(event, HostAlertEvent):
+            self._notify_host_alert(event)
+            dirty.add(server)
         elif isinstance(event, ActionResultEvent):
             self._busy.pop(f"{server}|{event.busy_key}", None)
             self._on_action_result(event)
@@ -674,6 +783,9 @@ class Dashboard(ctk.CTk):
 
     def _on_action_result(self, event: ActionResultEvent) -> None:
         result = event.result
+        level = "error" if result.outcome is ActionOutcome.ERROR else "info"
+        self.log_windows_event(f"[{event.server}] Ação '{event.action_label}' em {event.target}: "
+                               f"{result.outcome.value} — {result.message}", level, "action")
         if result.outcome is ActionOutcome.ERROR:
             self.set_status(f"[{event.server}] {result.message}", error=True)
             if self.winfo_viewable():
@@ -692,6 +804,8 @@ class Dashboard(ctk.CTk):
         if event.state is ConnectionState.RECONNECTING:
             if server not in self._offline_notified:
                 self._offline_notified.add(server)
+                self.log_windows_event(f"[{server}] Sem conexão SSH: {event.message}", "error", "connection_lost")
+                self._flash(True)
                 if settings.notify_on_disconnect:
                     title = ("Conexão perdida" if previous and previous.state is ConnectionState.CONNECTED
                              else "Servidor inacessível")
@@ -699,23 +813,37 @@ class Dashboard(ctk.CTk):
                                           key=f"{server}:connection")
         elif event.state is ConnectionState.CONNECTED and server in self._offline_notified:
             self._offline_notified.discard(server)
+            self.log_windows_event(f"[{server}] Conexão SSH restabelecida.", "info", "connection_restored")
             if settings.notify_on_disconnect and settings.notify_on_recovery:
                 self._notifier.notify(f"Conexão restabelecida: {server}", event.message,
                                       key=f"{server}:connection-restored")
 
     def _notify_threshold(self, event: ThresholdAlertEvent) -> None:
-        value = fmt_num(event.value, 0)
+        value = f"{fmt_num(event.value, 0)}{event.unit}"
+        limit = f"{fmt_num(event.threshold, 0)}{event.unit}"
         if event.recovered:
+            self.log_windows_event(f"[{event.server}] {event.label} normalizado: {value}.", "info", "threshold")
             if self.settings.notifications.notify_on_recovery:
-                self._notifier.notify(f"{event.label} normalizado — {event.server}", f"Agora em {value}%.",
+                self._notifier.notify(f"{event.label} normalizado — {event.server}", f"Agora em {value}.",
                                       key=f"{event.server}:{event.metric}:ok")
             return
-        log.warning("[%s] limite excedido: %s %s%%", event.server, event.label, value)
-        self._notifier.notify(f"{event.label} em {value}% — {event.server}",
-                              f"Acima do limite configurado de {fmt_num(event.threshold, 0)}%.",
+        log.warning("[%s] limite excedido: %s %s", event.server, event.label, value)
+        self.log_windows_event(f"[{event.server}] {event.label} em {value} (limite {limit}).", "warning", "threshold")
+        self._notifier.notify(f"{event.label} em {value} — {event.server}",
+                              f"Acima do limite configurado de {limit}.",
                               key=f"{event.server}:{event.metric}")
-        self.set_status(f"[{event.server}] {event.label} em {value}% (limite {fmt_num(event.threshold, 0)}%)",
-                        warning=True)
+        self.set_status(f"[{event.server}] {event.label} em {value} (limite {limit})", warning=True)
+
+    def _notify_host_alert(self, event: HostAlertEvent) -> None:
+        level = "info" if event.recovered else event.level
+        log.log(logging.INFO if event.recovered else logging.WARNING, "[%s] %s: %s", event.server, event.title,
+                event.message)
+        self.log_windows_event(f"[{event.server}] {event.title} — {event.message}", level, event.category)
+        self._notifier.notify(event.title, event.message, key=event.key)
+        if not event.recovered:
+            self.set_status(f"[{event.server}] {event.title}", error=event.level == "critical",
+                            warning=event.level != "critical")
+            self._flash(event.level == "critical")
 
     def _dispatch_alerts(self, alerts: list[ServiceAlertEvent]) -> None:
         groups: dict[tuple[str, AlertKind], list[ServiceAlertEvent]] = defaultdict(list)
@@ -725,6 +853,10 @@ class Dashboard(ctk.CTk):
         for (server, kind), items in groups.items():
             names = [a.service.name for a in items]
             log.warning("[%s] alerta %s: %s", server, kind.value, ", ".join(names))
+            self.log_windows_event(f"[{server}] {', '.join(names)}: {verbs[kind]}",
+                                   "info" if kind is AlertKind.RECOVERED else "error",
+                                   "service_recovered" if kind is AlertKind.RECOVERED else "service_failed")
+            self._flash(kind is AlertKind.FAILED)
             if len(items) > 3:
                 plural = {AlertKind.FAILED: "falharam", AlertKind.STOPPED: "pararam",
                           AlertKind.RECOVERED: "se recuperaram"}[kind]
