@@ -1,0 +1,48 @@
+# /etc/sudoers.d/firawynix-monitor
+#
+# Instale SEMPRE com o visudo (valida a sintaxe antes de salvar):
+#   sudo visudo -f /etc/sudoers.d/firawynix-monitor
+#
+# Confirme o caminho absoluto do systemctl no servidor e ajuste abaixo:
+#   command -v systemctl      # /usr/bin/systemctl (Debian 10+, Ubuntu, RHEL 8+) ou /bin/systemctl
+#
+# O Firawynix Monitor executa EXATAMENTE estes comandos, sempre com "sudo -n"
+# (não interativo: se o sudoers exigir senha, a ação falha na hora e a
+# interface explica o motivo — o monitor nunca envia senha ao sudo):
+#
+#   systemctl --no-block start   <unidade>.service
+#   systemctl --no-block stop    <unidade>.service
+#   systemctl --no-block restart <unidade>.service
+#   journalctl -u <unidade>.service -n <N> --no-pager    (somente com "logs_sudo": true)
+#   docker start|stop -t 3|restart -t 3 <contêiner>      (somente com "docker_sudo": true)
+#
+# O usuário "monitor" é apenas um exemplo: use o mesmo "username" do servers.json.
+
+# ---------------------------------------------------------------------------
+# Opção A (recomendada) — somente os serviços que podem ser controlados.
+# ---------------------------------------------------------------------------
+Cmnd_Alias FWX_NGINX = /usr/bin/systemctl --no-block start nginx.service, \
+                       /usr/bin/systemctl --no-block stop nginx.service, \
+                       /usr/bin/systemctl --no-block restart nginx.service
+
+Cmnd_Alias FWX_APP   = /usr/bin/systemctl --no-block restart gunicorn.service, \
+                       /usr/bin/systemctl --no-block restart celery-worker.service
+
+monitor ALL=(root) NOPASSWD: FWX_NGINX, FWX_APP
+
+# ---------------------------------------------------------------------------
+# Opção B — qualquer serviço (mais simples, menos restritiva).
+# Atenção: no sudoers o "*" casa com qualquer texto, inclusive argumentos
+# extras. O monitor valida o nome da unidade antes de executar, mas a regra
+# também vale para quem usar a mesma conta via SSH manualmente.
+# ---------------------------------------------------------------------------
+# Cmnd_Alias FWX_ANY = /usr/bin/systemctl --no-block start *, \
+#                      /usr/bin/systemctl --no-block stop *, \
+#                      /usr/bin/systemctl --no-block restart *
+# monitor ALL=(root) NOPASSWD: FWX_ANY
+
+# ---------------------------------------------------------------------------
+# Logs e Docker SEM sudo (preferível):
+#   sudo usermod -aG systemd-journal monitor   # journalctl de todos os serviços
+#   sudo usermod -aG docker monitor            # ATENÇÃO: grupo docker ≈ acesso root
+# ---------------------------------------------------------------------------

@@ -1,0 +1,19 @@
+[project]
+name = "firawynix-monitor"
+version = "1.0.0"
+description = "Monitor desktop (Windows) de serviços systemd e contêineres Docker em servidores Linux via SSH."
+readme = "README.md"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "SIM"]
+ignore = ["SIM105", "SIM108"]

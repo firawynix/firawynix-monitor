@@ -1,0 +1,44 @@
+{
+  "_comment": "Copie para servers.json. Segredos NUNCA ficam aqui: use password_env/key_passphrase_env (variáveis de ambiente ou .env).",
+  "settings": {
+    "poll_interval_seconds": 5,
+    "command_timeout_seconds": 5,
+    "connect_timeout_seconds": 5,
+    "minimize_to_tray": true,
+    "start_minimized": false,
+    "appearance_mode": "dark",
+    "log_lines": 50,
+    "notifications": {
+      "enabled": true,
+      "notify_on_recovery": true,
+      "notify_on_disconnect": true,
+      "alert_on_stop": false,
+      "cooldown_seconds": 120
+    }
+  },
+  "servers": [
+    {
+      "name": "prod-web-01",
+      "host": "192.168.10.21",
+      "port": 22,
+      "username": "monitor",
+      "key_file": "~/.ssh/id_ed25519",
+      "key_passphrase_env": "PROD_WEB_KEY_PASSPHRASE",
+      "use_sudo": true,
+      "docker": "auto",
+      "docker_sudo": false,
+      "critical_services": ["nginx", "postgresql*", "redis-server", "docker:api", "docker:worker"],
+      "exclude_services": ["systemd-*", "getty@*", "user@*"]
+    },
+    {
+      "name": "staging",
+      "host": "staging.example.com",
+      "port": 2222,
+      "username": "deploy",
+      "password_env": "STAGING_SSH_PASSWORD",
+      "host_key_policy": "strict",
+      "docker": "off",
+      "poll_interval_seconds": 10
+    }
+  ]
+}
