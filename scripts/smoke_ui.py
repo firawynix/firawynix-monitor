@@ -10,6 +10,7 @@ Usado no CI (runner Windows) e útil localmente para conferir a interface.
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import sys
 import time
 import traceback
@@ -36,8 +37,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", type=Path, default=Path("capturas"))
     parser.add_argument("--timeout", type=float, default=30.0, help="espera máxima de cada etapa (s)")
+    parser.add_argument("--total", type=float, default=240.0,
+                        help="limite total (s): passado dele, imprime a pilha de todas as threads e sai")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
+    sys.stdout.reconfigure(line_buffering=True)  # andamento visível no log do CI mesmo se travar
+    # Se a thread da interface travar (nenhuma espera por etapa roda), mostra onde e encerra com erro.
+    faulthandler.dump_traceback_later(args.total, exit=True)
 
     apply_theme("dark")
     config = demo_config()
