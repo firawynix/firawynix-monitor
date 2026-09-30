@@ -1,7 +1,9 @@
 # CI do Firawynix Monitor: lint, testes no Windows (onde o app roda) e no Linux,
 # teste de fumaça da interface num Windows de verdade e o .exe pronto para baixar
-# (aba Actions → execução → Artifacts). Uma tag "v<versão>" (ex.: v3.2.0) publica a
-# versão em Releases com o .exe — só se tudo acima passar.
+# (aba Actions → execução → Artifacts). A versão vai para Releases com o .exe — só se
+# tudo acima passar — ao enviar a tag "v<versão>" (ex.: v3.2.0) ou ao rodar o workflow
+# manualmente (Actions → CI → Run workflow) marcando "publicar": aí o GitHub cria a tag
+# v<versão> (de core/__init__.py) no commit testado.
 name: CI
 
 on:
@@ -10,6 +12,11 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      publicar:
+        description: "Publicar a versão de core/__init__.py em Releases (cria a tag v<versão>)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -119,7 +126,7 @@ jobs:
 
   release:
     name: Publicar versão (Releases)
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.publicar == 'true'
     needs: [build, ui-smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -127,21 +134,33 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: A tag precisa bater com a versão do código
+      - name: Versão, tag e notas
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           code=$(python3 -c "import core; print(core.__version__)")
-          if [ "${GITHUB_REF_NAME#v}" != "$code" ]; then
-            echo "::error::A tag $GITHUB_REF_NAME não corresponde à versão $code (core/__init__.py)."
-            exit 1
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tag="$GITHUB_REF_NAME"
+            if [ "${tag#v}" != "$code" ]; then
+              echo "::error::A tag $tag não corresponde à versão $code (core/__init__.py)."
+              exit 1
+            fi
+          else
+            tag="v$code"
+            if gh release view "$tag" >/dev/null 2>&1; then
+              echo "::error::A versão $tag já foi publicada. Atualize __version__ em core/__init__.py."
+              exit 1
+            fi
           fi
-          test -f "docs/releases/$GITHUB_REF_NAME.md" || { echo "::error::Faltam as notas docs/releases/$GITHUB_REF_NAME.md"; exit 1; }
+          test -f "docs/releases/$tag.md" || { echo "::error::Faltam as notas docs/releases/$tag.md"; exit 1; }
+          echo "TAG=$tag" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
           name: FirawynixMonitor-windows
           path: pacote
       - name: Arquivos da versão
         run: |
-          name="FirawynixMonitor-$GITHUB_REF_NAME"
+          name="FirawynixMonitor-$TAG"
           cp pacote/FirawynixMonitor.exe "$name.exe"
           rm -f pacote/FirawynixMonitor.exe.sha256
           (cd pacote && zip -r -q "../$name-windows.zip" .)
@@ -151,7 +170,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          name="FirawynixMonitor-$GITHUB_REF_NAME"
-          gh release create "$GITHUB_REF_NAME" "$name.exe" "$name-windows.zip" SHA256SUMS.txt \
-            --verify-tag --title "Firawynix Monitor ${GITHUB_REF_NAME#v}" \
-            --notes-file "docs/releases/$GITHUB_REF_NAME.md"
+          name="FirawynixMonitor-$TAG"
+          # Sem a tag no repositório (disparo manual), o GitHub a cria neste commit testado.
+          gh release create "$TAG" "$name.exe" "$name-windows.zip" SHA256SUMS.txt \
+            --target "$GITHUB_SHA" --title "Firawynix Monitor ${TAG#v}" \
+            --notes-file "docs/releases/$TAG.md"

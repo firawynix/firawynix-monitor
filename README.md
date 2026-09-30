@@ -561,8 +561,9 @@ ciano embutido). Manualmente: `pip install -r requirements-dev.txt` e
 
 **Sem compilar**: baixe o `.exe` pronto na página **Releases** do repositório (cada versão
 traz o executável, um `.zip` com os exemplos e o `SHA256SUMS.txt`). Para publicar uma versão,
-atualize `__version__` em `core/__init__.py`, escreva `docs/releases/v<versão>.md` e envie a
-tag `v<versão>`: o CI só publica se todos os testes, a fumaça da interface e o build passarem.
+atualize `__version__` em `core/__init__.py`, escreva `docs/releases/v<versão>.md` e rode o
+workflow **CI** manualmente (Actions → CI → *Run workflow*, marcando *publicar*) — ou envie a tag
+`v<versão>`. O CI só publica se todos os testes, a fumaça da interface e o build passarem.
 Além disso, a cada push o GitHub Actions gera o executável num Windows de verdade,
 roda-o por 20 s em modo demonstração e publica o pacote — na aba **Actions**, abra a
 execução mais recente do workflow **CI** e baixe o artefato **FirawynixMonitor-windows**
