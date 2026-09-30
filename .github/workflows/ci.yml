@@ -1,11 +1,13 @@
 # CI do Firawynix Monitor: lint, testes no Windows (onde o app roda) e no Linux,
 # teste de fumaça da interface num Windows de verdade e o .exe pronto para baixar
-# (aba Actions → execução → Artifacts).
+# (aba Actions → execução → Artifacts). Uma tag "v<versão>" (ex.: v3.2.0) publica a
+# versão em Releases com o .exe — só se tudo acima passar.
 name: CI
 
 on:
   push:
     branches: ["**"]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -114,3 +116,42 @@ jobs:
         with:
           name: FirawynixMonitor-windows
           path: dist/
+
+  release:
+    name: Publicar versão (Releases)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, ui-smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: A tag precisa bater com a versão do código
+        run: |
+          code=$(python3 -c "import core; print(core.__version__)")
+          if [ "${GITHUB_REF_NAME#v}" != "$code" ]; then
+            echo "::error::A tag $GITHUB_REF_NAME não corresponde à versão $code (core/__init__.py)."
+            exit 1
+          fi
+          test -f "docs/releases/$GITHUB_REF_NAME.md" || { echo "::error::Faltam as notas docs/releases/$GITHUB_REF_NAME.md"; exit 1; }
+      - uses: actions/download-artifact@v4
+        with:
+          name: FirawynixMonitor-windows
+          path: pacote
+      - name: Arquivos da versão
+        run: |
+          name="FirawynixMonitor-$GITHUB_REF_NAME"
+          cp pacote/FirawynixMonitor.exe "$name.exe"
+          rm -f pacote/FirawynixMonitor.exe.sha256
+          (cd pacote && zip -r -q "../$name-windows.zip" .)
+          sha256sum "$name.exe" "$name-windows.zip" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Criar a versão no GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name="FirawynixMonitor-$GITHUB_REF_NAME"
+          gh release create "$GITHUB_REF_NAME" "$name.exe" "$name-windows.zip" SHA256SUMS.txt \
+            --verify-tag --title "Firawynix Monitor ${GITHUB_REF_NAME#v}" \
+            --notes-file "docs/releases/$GITHUB_REF_NAME.md"
